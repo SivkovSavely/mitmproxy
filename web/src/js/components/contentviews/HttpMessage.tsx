@@ -111,7 +111,7 @@ function HttpMessageView({ flow, message, startEdit }: HttpMessageViewProps) {
         useAppSelector((state) => state.options.content_view_lines_cutoff),
     );
     const showMore = useCallback(
-        () => setMaxLines(Math.max(1024, maxLines * 2)),
+        () => setMaxLines(maxLines + 10000),
         [maxLines],
     );
 

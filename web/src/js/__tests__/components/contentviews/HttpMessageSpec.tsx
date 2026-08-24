@@ -379,6 +379,6 @@ describe("HttpMessage JSON view", () => {
 
         const urlsAfter = contentUrls();
         expect(urlsAfter).toHaveLength(2);
-        expect(urlsAfter[1]).toContain("?lines=1025");
+        expect(urlsAfter[1]).toContain("?lines=10513");
     });
 });
