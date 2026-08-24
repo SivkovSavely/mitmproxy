@@ -1,4 +1,4 @@
-import { TFlow } from "../../ducks/tutils";
+import { TFlow, TStore, testState } from "../../ducks/tutils";
 import * as React from "react";
 import HttpMessage, {
     ViewImage,
@@ -8,8 +8,16 @@ import fetchMock, { enableFetchMocks } from "jest-fetch-mock";
 
 enableFetchMocks();
 
+type CapturedCodeEditorProps = {
+    initialContent: string;
+    onChange?: (content: string) => void;
+    readonly?: boolean;
+    language?: string | null;
+};
+
 let mockUseCodeEditor = false,
-    mockCapturedOnChange: ((content: string) => void) | null = null;
+    mockCapturedOnChange: ((content: string) => void) | null = null,
+    mockCapturedProps: CapturedCodeEditorProps | null = null;
 
 jest.mock("../../../components/contentviews/CodeEditor", () => {
     const actual = jest.requireActual(
@@ -20,14 +28,24 @@ jest.mock("../../../components/contentviews/CodeEditor", () => {
         default: ({
             initialContent,
             onChange,
-        }: {
-            initialContent: string;
-            onChange: (c: string) => void;
-        }) => {
+            readonly,
+            language,
+        }: CapturedCodeEditorProps) => {
             if (!mockUseCodeEditor) {
-                return actual.default({ initialContent, onChange });
+                return actual.default({
+                    initialContent,
+                    onChange,
+                    readonly,
+                    language: language as never,
+                });
             }
-            mockCapturedOnChange = onChange;
+            mockCapturedOnChange = onChange ?? null;
+            mockCapturedProps = {
+                initialContent,
+                onChange,
+                readonly,
+                language,
+            };
             return (
                 <textarea
                     data-testid="mock-editor"
@@ -173,12 +191,14 @@ describe("HttpMessage body edit", () => {
     beforeEach(() => {
         mockUseCodeEditor = true;
         mockCapturedOnChange = null;
+        mockCapturedProps = null;
         fetchMock.resetMocks();
     });
 
     afterEach(() => {
         mockUseCodeEditor = false;
         mockCapturedOnChange = null;
+        mockCapturedProps = null;
     });
 
     test("saving empty body sends empty string, not original content", async () => {
@@ -238,5 +258,112 @@ describe("HttpMessage body edit", () => {
             const body = JSON.parse(putCall![1]!.body as string);
             expect(body.request.content).toBe("original body");
         });
+    });
+});
+
+describe("HttpMessage JSON view", () => {
+    const cvdJson = {
+        view_name: "JSON",
+        description: "",
+        syntax_highlight: "yaml",
+    };
+    const expectJsonEditor = async (content: string) => {
+        await waitFor(() =>
+            expect(mockCapturedProps).toMatchObject({
+                language: "json",
+                readonly: true,
+                initialContent: content,
+            }),
+        );
+    };
+
+    beforeEach(() => {
+        mockUseCodeEditor = true;
+        mockCapturedOnChange = null;
+        mockCapturedProps = null;
+        fetchMock.resetMocks();
+    });
+
+    afterEach(() => {
+        mockUseCodeEditor = false;
+        mockCapturedOnChange = null;
+        mockCapturedProps = null;
+    });
+
+    test("renders request bodies read-only in json mode", async () => {
+        fetchMock.mockResponse(
+            JSON.stringify({ text: '{"a": [1, 2]}', ...cvdJson }),
+        );
+
+        const tflow = TFlow();
+        render(<HttpMessage flow={tflow} message={tflow.request} />);
+
+        await expectJsonEditor('{"a": [1, 2]}');
+        expect(screen.queryByText("Show more")).toBeNull();
+    });
+
+    test("renders response bodies read-only in json mode", async () => {
+        fetchMock.mockResponse(
+            JSON.stringify({ text: '{"b": {"c": 3}}', ...cvdJson }),
+        );
+
+        const tflow = TFlow();
+        render(<HttpMessage flow={tflow} message={tflow.response} />);
+
+        await expectJsonEditor('{"b": {"c": 3}}');
+    });
+
+    test("switching Auto -> JSON uses the json viewer despite the yaml hint", async () => {
+        fetchMock.mockResponses(
+            JSON.stringify({
+                text: "not json\nsecond line",
+                view_name: "Raw",
+                description: "",
+                syntax_highlight: "none",
+            }),
+            JSON.stringify({ text: '{"d": 4}', ...cvdJson }),
+        );
+        const state = {
+            ...testState,
+            backendState: {
+                ...testState.backendState,
+                contentViews: [...testState.backendState.contentViews, "JSON"],
+            },
+        };
+
+        const tflow = TFlow();
+        render(<HttpMessage flow={tflow} message={tflow.request} />, {
+            store: TStore(state),
+        });
+        await waitFor(() => screen.getAllByText("not json"));
+        expect(mockCapturedProps).toBeNull();
+
+        fireEvent.click(screen.getByText("auto"));
+        fireEvent.click(screen.getByText("json"));
+
+        await expectJsonEditor('{"d": 4}');
+    });
+
+    test("truncated json shows maxLines lines plus Show more", async () => {
+        const fullJson =
+            '{\n' + '"line",\n'.repeat(512) + '"last"\n}';
+        fetchMock.mockResponse(JSON.stringify({ text: fullJson, ...cvdJson }));
+
+        const tflow = TFlow();
+        render(<HttpMessage flow={tflow} message={tflow.request} />);
+
+        await expectJsonEditor(expect.any(String));
+        const editor = screen.getByTestId("mock-editor") as HTMLTextAreaElement;
+        expect(editor.defaultValue.split("\n")).toHaveLength(512);
+        expect(editor.defaultValue).not.toContain('"last"');
+
+        fireEvent.click(screen.getByText("Show more"));
+        await waitFor(() => {
+            const grown = screen.getByTestId(
+                "mock-editor",
+            ) as HTMLTextAreaElement;
+            expect(grown.defaultValue).toContain('"last"');
+        });
+        expect(screen.queryByText("Show more")).toBeNull();
     });
 });

@@ -50,3 +50,14 @@ test("CodeEditor highlights CSS", async () => {
     );
     expect(asFragment()).toMatchSnapshot();
 });
+
+test("CodeEditor highlights JSON", async () => {
+    const { asFragment } = render(
+        <CodeEditor
+            initialContent={"{\"foo\": [1, 2]}"}
+            readonly
+            language="json"
+        />,
+    );
+    expect(asFragment()).toMatchSnapshot();
+});

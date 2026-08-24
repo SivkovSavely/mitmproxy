@@ -4,16 +4,19 @@ import CodeMirror from "@uiw/react-codemirror";
 import { css } from "@codemirror/lang-css";
 import { html } from "@codemirror/lang-html";
 import { javascript } from "@codemirror/lang-javascript";
+import { json } from "@codemirror/lang-json";
 import { yaml } from "@codemirror/lang-yaml";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { SyntaxHighlight } from "../../backends/consts";
 import { useResolvedTheme } from "../helpers/useTheme";
 
+type CodeEditorLanguage = SyntaxHighlight | "json";
+
 type CodeEditorProps = {
     initialContent: string;
-    onChange: (content: string) => void;
+    onChange?: (content: string) => void;
     readonly?: boolean;
-    language?: SyntaxHighlight | null;
+    language?: CodeEditorLanguage | null;
 };
 
 export default function CodeEditor({
@@ -35,6 +38,8 @@ export default function CodeEditor({
                 return [html()];
             case SyntaxHighlight.JAVASCRIPT:
                 return [javascript()];
+            case "json":
+                return [json()];
             case SyntaxHighlight.CSS:
                 return [css()];
             case undefined:

@@ -12,6 +12,7 @@ import { uploadContent } from "../../ducks/flows";
 import Button from "../common/Button";
 import CodeEditor from "./CodeEditor";
 import ContentRenderer from "./ContentRenderer";
+import Icon from "../common/Icon";
 import ViewSelector from "./ViewSelector";
 import { copyViewContentDataToClipboard, fetchApi } from "../../utils";
 
@@ -132,6 +133,14 @@ function HttpMessageView({ flow, message, startEdit }: HttpMessageViewProps) {
             `${contentViewData.view_name} ${contentViewData.description}`.trimEnd();
     }
 
+    // The JSON view is fetched with maxLines + 1 lines, so more lines than
+    // that indicate the body was cut off.
+    const jsonLines =
+        contentViewData?.view_name === "JSON"
+            ? contentViewData.text.split("\n")
+            : [];
+    const jsonTruncated = jsonLines.length > maxLines;
+
     return (
         <div className="contentview" key="view">
             <div className="controls">
@@ -169,11 +178,30 @@ function HttpMessageView({ flow, message, startEdit }: HttpMessageViewProps) {
             {ViewImage.matches(message) && (
                 <ViewImage flow={flow} message={message} />
             )}
-            <ContentRenderer
-                content={contentViewData?.text ?? ""}
-                maxLines={maxLines}
-                showMore={showMore}
-            />
+            {jsonLines.length > 0 ? (
+                <>
+                    <CodeEditor
+                        initialContent={
+                            jsonTruncated
+                                ? jsonLines.slice(0, maxLines).join("\n")
+                                : jsonLines.join("\n")
+                        }
+                        readonly
+                        language="json"
+                    />
+                    {jsonTruncated && (
+                        <button onClick={showMore} className="btn btn-xs btn-info">
+                            <Icon name="expandMore" /> Show more
+                        </button>
+                    )}
+                </>
+            ) : (
+                <ContentRenderer
+                    content={contentViewData?.text ?? ""}
+                    maxLines={maxLines}
+                    showMore={showMore}
+                />
+            )}
         </div>
     );
 }
