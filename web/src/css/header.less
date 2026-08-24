@@ -151,6 +151,12 @@ header {
         max-height: 500px;
         overflow-y: auto;
 
+        .filter-desc {
+            margin: 0 0 9px;
+            padding-bottom: 9px;
+            border-bottom: 1px solid var(--mitmweb-border-light);
+        }
+
         .table {
             width: 100%;
             margin-bottom: 0;
@@ -184,6 +190,7 @@ header {
 
         tr {
             cursor: pointer;
+            &.active,
             &:hover {
                 background-color: var(--mitmweb-highlight) !important;
             }

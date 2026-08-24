@@ -1,9 +1,11 @@
 import * as React from "react";
+import { enableFetchMocks } from "jest-fetch-mock";
 import FilterInput, {
     FilterIcon,
 } from "../../../components/Header/FilterInput";
-import FilterDocs from "../../../components/Header/FilterDocs";
-import { act, fireEvent, render } from "../../test-utils";
+import { act, fireEvent, render, waitFor } from "../../test-utils";
+
+enableFetchMocks();
 
 describe("FilterInput Component", () => {
     it("should render correctly", () => {
@@ -98,7 +100,7 @@ describe("FilterInput Component", () => {
         const filterInput = dummyInput();
 
         act(() => filterInput.setState({ value: "" }));
-        expect(filterInput.getDesc().type).toEqual(FilterDocs);
+        expect(filterInput.getDesc()).toBeUndefined();
 
         act(() => filterInput.setState({ value: "~u foo" }));
         expect(filterInput.getDesc()).toEqual("url matches /foo/i");
@@ -107,6 +109,40 @@ describe("FilterInput Component", () => {
         expect(filterInput.getDesc()).toEqual(
             'SyntaxError: Expected filter expression but "~" found.',
         );
+    });
+
+    it("shows the parsed hint above the docs table while typing", async () => {
+        fetchMock.mockOnceIf(
+            "./filter-help",
+            JSON.stringify({
+                commands: [
+                    ["~a", "is asset"],
+                    ["~b regex", "Body"],
+                ],
+            }),
+        );
+
+        const { getByPlaceholderText, findByText } = render(
+            <FilterInput
+                icon={FilterIcon.SEARCH}
+                color="red"
+                placeholder="bar"
+                value="~a abcd"
+                onChange={() => undefined}
+            />,
+        );
+        fireEvent.focus(getByPlaceholderText("bar"));
+
+        // The hint for the current value and the full docs are rendered
+        // together in one popover, with the active command highlighted.
+        await findByText("is asset and url matches /abcd/i");
+        const popover = getByPlaceholderText("bar").closest(".filter-input")!;
+        await waitFor(() =>
+            expect(popover.querySelector(".popover-content tr.active")).not.toBeNull(),
+        );
+        expect(
+            popover.querySelector(".popover-content tr.active")!.textContent,
+        ).toContain("~a");
     });
 
     it("should handle change", () => {
@@ -166,9 +202,13 @@ describe("FilterInput Component", () => {
         const input = filterInput.inputRef.current!;
         input.focus = jest.fn();
         act(() => filterInput.selectFilter("bar"));
-        expect(filterInput.state.value).toEqual("bar");
+        // Appends to the existing value instead of replacing it.
+        expect(filterInput.state.value).toEqual("wat bar");
+        expect(filterInput.getDesc()).toEqual(
+            "url matches /wat/i and url matches /bar/i",
+        );
         expect(input.focus).toBeCalled();
-        expect(filterInput.props.onChange).toBeCalledWith("bar");
+        expect(filterInput.props.onChange).toBeCalledWith("wat bar");
     });
 
     it("should handle select", () => {

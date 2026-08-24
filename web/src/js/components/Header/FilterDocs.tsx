@@ -4,6 +4,7 @@ import Icon from "../common/Icon";
 
 type FilterDocsProps = {
     selectHandler: (cmd: string) => void;
+    highlight?: string;
 };
 
 type FilterDocsDoc = {
@@ -55,6 +56,11 @@ export default class FilterDocs extends Component<
                     {doc.commands.map((cmd) => (
                         <tr
                             key={cmd[1]}
+                            className={
+                                cmd[0].split(" ")[0] === this.props.highlight
+                                    ? "active"
+                                    : undefined
+                            }
                             onClick={() =>
                                 this.props.selectHandler(
                                     cmd[0].split(" ")[0] + " ",

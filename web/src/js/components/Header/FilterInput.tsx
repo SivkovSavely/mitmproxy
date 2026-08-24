@@ -72,9 +72,9 @@ export default class FilterInput extends Component<
         }
     }
 
-    getDesc() {
+    getDesc(): string | undefined {
         if (!this.state.value) {
-            return <FilterDocs selectHandler={this.selectFilter} />;
+            return undefined;
         }
         try {
             return Filt.parse(this.state.value).desc;
@@ -119,12 +119,16 @@ export default class FilterInput extends Component<
     }
 
     selectFilter(value: string) {
-        this.setState({ value });
+        // Appending keeps the filter the user has already typed;
+        // whitespace-separated expressions are combined with `and`.
+        const current = this.state.value.trimEnd();
+        const next = current ? `${current} ${value}` : value;
+        this.setState({ value: next });
         this.inputRef.current?.focus();
 
         // Only propagate valid filters upwards.
-        if (this.isValid(value)) {
-            this.props.onChange(value);
+        if (this.isValid(next)) {
+            this.props.onChange(next);
         }
     }
 
@@ -139,6 +143,10 @@ export default class FilterInput extends Component<
     render() {
         const { icon, color, placeholder } = this.props;
         const { value, focus, mousefocus } = this.state;
+        const desc = this.getDesc();
+        // The leading command of the current input, if any, is highlighted
+        // in the docs table below.
+        const command = value.trim().split(/\s+/)[0] || undefined;
         return (
             <div
                 className={classnames("filter-input input-group", {
@@ -168,7 +176,13 @@ export default class FilterInput extends Component<
                         onMouseLeave={this.onMouseLeave}
                     >
                         <div className="arrow" />
-                        <div className="popover-content">{this.getDesc()}</div>
+                        <div className="popover-content">
+                            {desc && <p className="filter-desc">{desc}</p>}
+                            <FilterDocs
+                                selectHandler={this.selectFilter}
+                                highlight={command}
+                            />
+                        </div>
                     </div>
                 )}
             </div>
