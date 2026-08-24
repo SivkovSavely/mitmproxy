@@ -345,9 +345,12 @@ describe("HttpMessage JSON view", () => {
     });
 
     test("truncated json shows maxLines lines plus Show more", async () => {
-        const fullJson =
-            '{\n' + '"line",\n'.repeat(512) + '"last"\n}';
-        fetchMock.mockResponse(JSON.stringify({ text: fullJson, ...cvdJson }));
+        const fullJson = '{\n' + '"line",\n'.repeat(512) + '"last"\n}';
+        const truncatedJson = '{\n' + '"line",\n'.repeat(512);
+        fetchMock.mockResponses(
+            JSON.stringify({ text: truncatedJson, ...cvdJson }),
+            JSON.stringify({ text: fullJson, ...cvdJson }),
+        );
 
         const tflow = TFlow();
         render(<HttpMessage flow={tflow} message={tflow.request} />);
@@ -357,6 +360,14 @@ describe("HttpMessage JSON view", () => {
         expect(editor.defaultValue.split("\n")).toHaveLength(512);
         expect(editor.defaultValue).not.toContain('"last"');
 
+        const contentUrls = () =>
+            fetchMock.mock.calls
+                .map(([url]) => String(url))
+                .filter((url) => url.includes("/content/"));
+        expect(contentUrls()).toEqual([
+            expect.stringContaining("?lines=513"),
+        ]);
+
         fireEvent.click(screen.getByText("Show more"));
         await waitFor(() => {
             const grown = screen.getByTestId(
@@ -365,5 +376,9 @@ describe("HttpMessage JSON view", () => {
             expect(grown.defaultValue).toContain('"last"');
         });
         expect(screen.queryByText("Show more")).toBeNull();
+
+        const urlsAfter = contentUrls();
+        expect(urlsAfter).toHaveLength(2);
+        expect(urlsAfter[1]).toContain("?lines=1025");
     });
 });
