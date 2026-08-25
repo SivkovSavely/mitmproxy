@@ -154,6 +154,32 @@
         overflow-y: auto;
     }
 
+    .kv-row-action {
+        flex-shrink: 0;
+        margin-left: 0.3em;
+
+        // Only show the header filter action while hovering the row,
+        // mirroring the unobtrusive .kv-add-row behavior.
+        opacity: 0;
+        transition: all 100ms ease-in-out;
+    }
+
+    .kv-row:hover .kv-row-action {
+        opacity: 1;
+    }
+
+    .header-filter.btn-sm {
+        height: 18px;
+        width: 18px;
+        padding: 0;
+        margin: 0;
+
+        .icon {
+            display: block;
+            margin: 0 auto;
+        }
+    }
+
     .kv-key {
         font-weight: bold;
     }

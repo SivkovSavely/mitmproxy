@@ -12,7 +12,10 @@ import ValueEditor from "../editors/ValueEditor";
 import { useAppDispatch, useAppSelector } from "../../ducks";
 import type { HTTPFlow, HTTPMessage, HTTPResponse } from "../../flow";
 import * as flowActions from "../../ducks/flows";
+import { setFilter } from "../../ducks/ui/filter";
+import { appendFilterClause, exactHeaderClause } from "../../filt/exactHeader";
 import KeyValueListEditor from "../editors/KeyValueListEditor";
+import Button from "../common/Button";
 import HttpMessage from "../contentviews/HttpMessage";
 
 type RequestLineProps = {
@@ -127,6 +130,7 @@ type HeadersProps = {
 function Headers({ flow, message }: HeadersProps) {
     const dispatch = useAppDispatch();
     const part = flow.request === message ? "request" : "response";
+    const search = useAppSelector((state) => state.ui.filter.search);
 
     return (
         <KeyValueListEditor
@@ -135,6 +139,23 @@ function Headers({ flow, message }: HeadersProps) {
             onChange={(headers) =>
                 dispatch(flowActions.update(flow, { [part]: { headers } }))
             }
+            rowAction={([name, value]) => (
+                <Button
+                    className="btn-sm header-filter"
+                    title={`Filter by exact ${part} header`}
+                    icon="filter"
+                    onClick={() =>
+                        dispatch(
+                            setFilter(
+                                appendFilterClause(
+                                    search,
+                                    exactHeaderClause(part, name, value),
+                                ),
+                            ),
+                        )
+                    }
+                />
+            )}
         />
     );
 }

@@ -31,15 +31,37 @@ Headers:
     ~u rex      URL
     ~c CODE     Response code.
     rex         Equivalent to ~u rex
+
+    Every regex filter has a case-sensitive variant with a "c" suffix
+    (~bc, ~bqc, ..., ~uc), which always matches case-sensitively. The plain
+    variants are case-insensitive unless MITMPROXY_CASE_SENSITIVE_FILTERS=1.
+
+HTTP timestamps:
+
+    Timestamps are compared against datetimes in the form YYYY-MM-DD or
+    YYYY-MM-DD[ T]HH:MM:SS[.ffffff], optionally followed by Z or ±HH:MM.
+    Supported comparisons: =, !=, >, >=, <, <=. Missing timestamps never
+    match.
+
+    ~dt cmp d   Any request/response timestamp
+    ~dtq cmp d  Any request timestamp
+    ~dts cmp d  Any response timestamp
+    ~dtqs cmp d Request start timestamp
+    ~dtqe cmp d Request end timestamp
+    ~dtss cmp d Response start timestamp
+    ~dtse cmp d Response end timestamp
 """
 
 import functools
+import operator
 import os
 import re
 import sys
 from abc import ABC
 from abc import abstractmethod
+from collections.abc import Iterator
 from collections.abc import Sequence
+from datetime import datetime
 from typing import AnyStr
 from typing import cast
 from typing import ClassVar
@@ -217,14 +239,20 @@ class FAll(_Action):
 
 class _Rex(Generic[AnyStr], _Action, ABC):
     flags: ClassVar[re.RegexFlag] = re.RegexFlag.NOFLAG
+    # Case-sensitive variants ignore MITMPROXY_CASE_SENSITIVE_FILTERS and
+    # never add re.IGNORECASE.
+    case_sensitive: ClassVar[bool] = False
 
     expr: str
     re: re.Pattern[AnyStr]
 
     def __init__(self, expr_str: str, expr: AnyStr):
         self.expr = expr_str
+        flags = self.flags
+        if not self.case_sensitive:
+            flags = flags | maybe_ignore_case
         try:
-            self.re = re.compile(expr, self.flags | maybe_ignore_case)
+            self.re = re.compile(expr, flags)
         except Exception:
             raise ValueError("Cannot compile expression.")
 
@@ -623,6 +651,152 @@ class FComment(_StrRex):
         return f"comment matches {self.regex_str}"
 
 
+_timestamp_comparators = {
+    "=": operator.eq,
+    "!=": operator.ne,
+    ">": operator.gt,
+    ">=": operator.ge,
+    "<": operator.lt,
+    "<=": operator.le,
+}
+
+# A narrow grammar for HTTP timestamps: a date, optionally followed by a time
+# (space or "T" separated) with an optional timezone. The internal space of
+# "YYYY-MM-DD HH:MM:SS" is consumed by this single token so that it cannot be
+# mistaken for the implicit-and separator between two filters.
+_datetime_grammar = pp.Regex(
+    r'["\']?\d{4}-\d{2}-\d{2}'
+    r"(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?"
+    r'["\']?'
+)
+_comparator_grammar = pp.Regex(r"!=|>=|<=|=|>|<")
+
+
+def parse_http_time(value: str) -> float:
+    """Parse a filter datetime into a Unix timestamp.
+
+    Date-only values denote midnight at the start of that date, timezone-less
+    values are interpreted in the local timezone of the mitmproxy process.
+    """
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"Invalid datetime: {value!r}") from None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.timestamp()
+
+
+def _message_times(*messages: http.Message | None) -> Iterator[float]:
+    for message in messages:
+        if message is None:
+            continue
+        yield message.timestamp_start
+        if message.timestamp_end is not None:
+            yield message.timestamp_end
+
+
+class FDateTime(_Action, ABC):
+    """Compare HTTP timestamps against a datetime.
+
+    A missing timestamp never matches, not even for `!=`. Aggregates match if
+    any existing timestamp in their field set satisfies the comparison.
+    """
+
+    code: ClassVar[str]
+    help: ClassVar[str]
+    field: ClassVar[str]
+
+    comparator: str
+    value: str
+    timestamp: float
+
+    def __init__(self, comparator: str, value: str):
+        if comparator not in _timestamp_comparators:
+            raise ValueError(f"Invalid comparator: {comparator!r}")
+        self.comparator = comparator
+        self.value = value.strip("\"'")
+        self.timestamp = parse_http_time(self.value)
+
+    def timestamps(self, f: http.HTTPFlow) -> Iterator[float]:
+        raise NotImplementedError  # pragma: no cover
+
+    @only(http.HTTPFlow)
+    def __call__(self, f) -> bool:
+        compare = _timestamp_comparators[self.comparator]
+        return any(compare(ts, self.timestamp) for ts in self.timestamps(f))
+
+    def __str__(self) -> str:
+        return f"{self.field} {self.comparator} {self.value}"
+
+
+class FDateTimeAny(FDateTime):
+    code = "dt"
+    help = "Any HTTP request/response start/end timestamp"
+    field = "http timestamp"
+
+    def timestamps(self, f: http.HTTPFlow) -> Iterator[float]:
+        yield from _message_times(f.request, f.response)
+
+
+class FDateTimeRequest(FDateTime):
+    code = "dtq"
+    help = "Any request start/end timestamp"
+    field = "request timestamp"
+
+    def timestamps(self, f: http.HTTPFlow) -> Iterator[float]:
+        yield from _message_times(f.request)
+
+
+class FDateTimeResponse(FDateTime):
+    code = "dts"
+    help = "Any response start/end timestamp"
+    field = "response timestamp"
+
+    def timestamps(self, f: http.HTTPFlow) -> Iterator[float]:
+        yield from _message_times(f.response)
+
+
+class FDateTimeRequestStart(FDateTime):
+    code = "dtqs"
+    help = "Request start timestamp"
+    field = "request start time"
+
+    def timestamps(self, f: http.HTTPFlow) -> Iterator[float]:
+        if f.request is not None:
+            yield f.request.timestamp_start
+
+
+class FDateTimeRequestEnd(FDateTime):
+    code = "dtqe"
+    help = "Request end timestamp"
+    field = "request end time"
+
+    def timestamps(self, f: http.HTTPFlow) -> Iterator[float]:
+        if f.request is not None and f.request.timestamp_end is not None:
+            yield f.request.timestamp_end
+
+
+class FDateTimeResponseStart(FDateTime):
+    code = "dtss"
+    help = "Response start timestamp"
+    field = "response start time"
+
+    def timestamps(self, f: http.HTTPFlow) -> Iterator[float]:
+        if f.response is not None:
+            yield f.response.timestamp_start
+
+
+class FDateTimeResponseEnd(FDateTime):
+    code = "dtse"
+    help = "Response end timestamp"
+    field = "response end time"
+
+    def timestamps(self, f: http.HTTPFlow) -> Iterator[float]:
+        if f.response is not None and f.response.timestamp_end is not None:
+            yield f.response.timestamp_end
+
+
 class _Int(_Action, ABC):
     def __init__(self, num):
         self.num = int(num)
@@ -712,7 +886,7 @@ filter_unary: Sequence[type[_Action]] = [
     FWebSocket,
     FAll,
 ]
-filter_rex: Sequence[type[_Rex]] = [
+_regex_filters: list[type[_Rex]] = [
     FBod,
     FBodRequest,
     FBodResponse,
@@ -732,6 +906,38 @@ filter_rex: Sequence[type[_Rex]] = [
     FComment,
 ]
 filter_int = [FCode]
+filter_datetime: Sequence[type[FDateTime]] = [
+    FDateTimeAny,
+    FDateTimeRequest,
+    FDateTimeResponse,
+    FDateTimeRequestStart,
+    FDateTimeRequestEnd,
+    FDateTimeResponseStart,
+    FDateTimeResponseEnd,
+]
+
+
+def _make_case_sensitive_variant(cls: type[_Rex]) -> type[_Rex]:
+    """Create the forced case-sensitive `~<code>c` variant of a regex filter."""
+    return cast(
+        type[_Rex],
+        type(
+            f"{cls.__name__}CaseSensitive",
+            (cls,),
+            {
+                "code": f"{cls.code}c",
+                "help": f"{cls.help} (case-sensitive)",
+                "case_sensitive": True,
+            },
+        ),
+    )
+
+
+# Every regex filter gets an explicit case-sensitive variant (~u -> ~uc, ...).
+filter_rex: Sequence[type[_Rex]] = [
+    *_regex_filters,
+    *(_make_case_sensitive_variant(cls) for cls in _regex_filters),
+]
 
 
 def _make():
@@ -759,6 +965,16 @@ def _make():
 
     for cls in filter_int:
         f = pp.Literal(f"~{cls.code}") + pp.WordEnd() + pp.Word(pp.nums)
+        f.set_parse_action(cls.make)
+        parts.append(f)
+
+    for cls in filter_datetime:
+        f = (
+            pp.Literal(f"~{cls.code}")
+            + pp.WordEnd()
+            + _comparator_grammar
+            + _datetime_grammar
+        )
         f.set_parse_action(cls.make)
         parts.append(f)
 
@@ -835,6 +1051,8 @@ for b in filter_rex:
     help.append((f"~{b.code} regex", b.help))
 for c in filter_int:
     help.append((f"~{c.code} int", c.help))
+for d in filter_datetime:
+    help.append((f"~{d.code} datetime", f"{d.help} (=, !=, >, >=, <, <=)"))
 help.sort()
 help.extend(
     [

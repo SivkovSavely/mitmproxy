@@ -33,6 +33,12 @@ function binding(expr) {
     return bindingFilter;
 }
 
+// Compile the user's regex. Plain operators are case-insensitive (mitmproxy's
+// default), their explicit `c` variants pass "" to match case-sensitively.
+function rex(pattern, flags) {
+    return new RegExp(pattern, flags === undefined ? "i" : flags);
+}
+
 // ~all
 function allFilter(flow) {
     return true;
@@ -65,7 +71,6 @@ assetFilter.desc = "is asset";
 
 // ~b
 function body(regex){
-    regex = new RegExp(regex, "i");
     function bodyFilter(flow){
         return true;
     }
@@ -75,7 +80,6 @@ function body(regex){
 
 // ~bq
 function requestBody(regex){
-    regex = new RegExp(regex, "i");
     function requestBodyFilter(flow){
         return true;
     }
@@ -85,7 +89,6 @@ function requestBody(regex){
 
 // ~bs
 function responseBody(regex){
-    regex = new RegExp(regex, "i");
     function responseBodyFilter(flow){
         return true;
     }
@@ -104,7 +107,6 @@ function responseCode(code){
 
 // ~comment
 function comment(regex){
-    regex = new RegExp(regex, "i");
     function commentFilter(flow){
         return regex.test(flow.comment)
     }
@@ -114,7 +116,6 @@ function comment(regex){
 
 // ~d
 function domain(regex){
-    regex = new RegExp(regex, "i");
     function domainFilter(flow){
         return flow.request && (regex.test(flow.request.host) || regex.test(flow.request.pretty_host));
     }
@@ -130,7 +131,6 @@ dnsFilter.desc = "is a DNS Flow";
 
 // ~dst
 function destination(regex){
-    regex = new RegExp(regex, "i");
     function destinationFilter(flow){
     return (!!flow.server_conn.address)
            &&
@@ -148,7 +148,6 @@ errorFilter.desc = "has error";
 
 // ~h
 function header(regex){
-    regex = new RegExp(regex, "i");
     function headerFilter(flow){
         return (
             (flow.request && flowutils.RequestUtils.match_header(flow.request, regex))
@@ -162,7 +161,6 @@ function header(regex){
 
 // ~hq
 function requestHeader(regex){
-    regex = new RegExp(regex, "i");
     function requestHeaderFilter(flow){
         return (flow.request && flowutils.RequestUtils.match_header(flow.request, regex));
     }
@@ -172,7 +170,6 @@ function requestHeader(regex){
 
 // ~hs
 function responseHeader(regex){
-    regex = new RegExp(regex, "i");
     function responseHeaderFilter(flow){
         return (flow.response && flowutils.ResponseUtils.match_header(flow.response, regex));
     }
@@ -194,7 +191,6 @@ markedFilter.desc = "is marked";
 
 // ~marker
 function marker(regex){
-    regex = new RegExp(regex, "i");
     function markerFilter(flow){
         return regex.test(flow.marked)
     }
@@ -204,12 +200,25 @@ function marker(regex){
 
 // ~m
 function method(regex){
-    regex = new RegExp(regex, "i");
     function methodFilter(flow){
         return flow.request && regex.test(flow.request.method);
     }
     methodFilter.desc = "method matches " + regex;
     return methodFilter;
+}
+
+// ~meta
+function meta(regex){
+    var metaLines = [];
+    function metaFilter(flow){
+        metaLines.length = 0;
+        for (var key in flow.metadata) {
+            metaLines.push(key + ": " + flow.metadata[key]);
+        }
+        return regex.test(metaLines.join("\n"));
+    }
+    metaFilter.desc = "flow metadata matches " + regex;
+    return metaFilter;
 }
 
 // ~q
@@ -238,7 +247,6 @@ replayFilter.desc = "flow has been replayed";
 
 // ~src
 function source(regex){
-    regex = new RegExp(regex, "i");
     function sourceFilter(flow){
         return (!!flow.client_conn.peername)
                &&
@@ -268,7 +276,6 @@ udpFilter.desc = "is a UDP Flow";
 
 // ~tq
 function requestContentType(regex){
-    regex = new RegExp(regex, "i");
     function requestContentTypeFilter(flow){
         return flow.request && regex.test(flowutils.RequestUtils.getContentType(flow.request));
     }
@@ -278,7 +285,6 @@ function requestContentType(regex){
 
 // ~ts
 function responseContentType(regex){
-    regex = new RegExp(regex, "i");
     function responseContentTypeFilter(flow){
         return flow.response && regex.test(flowutils.ResponseUtils.getContentType(flow.response));
     }
@@ -288,7 +294,6 @@ function responseContentType(regex){
 
 // ~t
 function contentType(regex){
-    regex = new RegExp(regex, "i");
     function contentTypeFilter(flow){
         return (
             (flow.request && regex.test(flowutils.RequestUtils.getContentType(flow.request)))
@@ -302,7 +307,6 @@ function contentType(regex){
 
 // ~u
 function url(regex){
-    regex = new RegExp(regex, "i");
     function urlFilter(flow){
         if (flow.type === "dns") {
             const question = flow.request?.questions[0]
@@ -319,6 +323,17 @@ function websocketFilter(flow){
     return !!flow.websocket;
 }
 websocketFilter.desc = "is a Websocket Flow";
+
+// ~dt, ~dtq, ~dts, ~dtqs, ~dtqe, ~dtss, ~dtse:
+// HTTP timestamp comparisons. mitmweb only describes these filters,
+// the authoritative evaluation happens in the backend.
+function httpTime(field, comparator, value){
+    function httpTimeFilter(flow){
+        return true;
+    }
+    httpTimeFilter.desc = field + " " + comparator + " " + value;
+    return httpTimeFilter;
+}
 }
 
 start "filter expression"
@@ -357,36 +372,114 @@ BindingExpr
 Expr
   = "~all" { return allFilter; }
   / "~a" { return assetFilter; }
-  / "~b" ws+ s:StringLiteral { return body(s); }
-  / "~bq" ws+ s:StringLiteral { return requestBody(s); }
-  / "~bs" ws+ s:StringLiteral { return responseBody(s); }
+  / "~b" ws+ s:StringLiteral { return body(rex(s)); }
+  / "~bc" ws+ s:StringLiteral { return body(rex(s, "")); }
+  / "~bq" ws+ s:StringLiteral { return requestBody(rex(s)); }
+  / "~bqc" ws+ s:StringLiteral { return requestBody(rex(s, "")); }
+  / "~bs" ws+ s:StringLiteral { return responseBody(rex(s)); }
+  / "~bsc" ws+ s:StringLiteral { return responseBody(rex(s, "")); }
   / "~c" ws+ s:IntegerLiteral { return responseCode(s); }
-  / "~comment" ws+ s:StringLiteral { return comment(s); }
-  / "~d" ws+ s:StringLiteral { return domain(s); }
+  / "~comment" ws+ s:StringLiteral { return comment(rex(s)); }
+  / "~commentc" ws+ s:StringLiteral { return comment(rex(s, "")); }
+  / "~d" ws+ s:StringLiteral { return domain(rex(s)); }
+  / "~dc" ws+ s:StringLiteral { return domain(rex(s, "")); }
   / "~dns" { return dnsFilter; }
-  / "~dst" ws+ s:StringLiteral { return destination(s); }
+  / "~dst" ws+ s:StringLiteral { return destination(rex(s)); }
+  / "~dstc" ws+ s:StringLiteral { return destination(rex(s, "")); }
   / "~e" { return errorFilter; }
-  / "~h" ws+ s:StringLiteral { return header(s); }
-  / "~hq" ws+ s:StringLiteral { return requestHeader(s); }
-  / "~hs" ws+ s:StringLiteral { return responseHeader(s); }
+  / "~h" ws+ s:StringLiteral { return header(rex(s)); }
+  / "~hc" ws+ s:StringLiteral { return header(rex(s, "")); }
+  / "~hq" ws+ s:StringLiteral { return requestHeader(rex(s)); }
+  / "~hqc" ws+ s:StringLiteral { return requestHeader(rex(s, "")); }
+  / "~hs" ws+ s:StringLiteral { return responseHeader(rex(s)); }
+  / "~hsc" ws+ s:StringLiteral { return responseHeader(rex(s, "")); }
   / "~http" { return httpFilter; }
   / "~marked" { return markedFilter; }
-  / "~marker" ws+ s:StringLiteral { return marker(s); }
-  / "~m" ws+ s:StringLiteral { return method(s); }
+  / "~marker" ws+ s:StringLiteral { return marker(rex(s)); }
+  / "~markerc" ws+ s:StringLiteral { return marker(rex(s, "")); }
+  / "~m" ws+ s:StringLiteral { return method(rex(s)); }
+  / "~mc" ws+ s:StringLiteral { return method(rex(s, "")); }
+  / "~meta" ws+ s:StringLiteral { return meta(rex(s)); }
+  / "~metac" ws+ s:StringLiteral { return meta(rex(s, "")); }
   / "~q" { return noResponseFilter; }
   / "~replayq" { return clientReplayFilter; }
   / "~replays" { return serverReplayFilter; }
   / "~replay" { return replayFilter; }
-  / "~src" ws+ s:StringLiteral { return source(s); }
+  / "~src" ws+ s:StringLiteral { return source(rex(s)); }
+  / "~srcc" ws+ s:StringLiteral { return source(rex(s, "")); }
   / "~s" { return responseFilter; }
   / "~tcp" { return tcpFilter; }
   / "~udp" { return udpFilter; }
-  / "~tq" ws+ s:StringLiteral { return requestContentType(s); }
-  / "~ts" ws+ s:StringLiteral { return responseContentType(s); }
-  / "~t" ws+ s:StringLiteral { return contentType(s); }
-  / "~u" ws+ s:StringLiteral { return url(s); }
+  / "~tq" ws+ s:StringLiteral { return requestContentType(rex(s)); }
+  / "~tqc" ws+ s:StringLiteral { return requestContentType(rex(s, "")); }
+  / "~ts" ws+ s:StringLiteral { return responseContentType(rex(s)); }
+  / "~tsc" ws+ s:StringLiteral { return responseContentType(rex(s, "")); }
+  / "~t" ws+ s:StringLiteral { return contentType(rex(s)); }
+  / "~tc" ws+ s:StringLiteral { return contentType(rex(s, "")); }
+  / TimestampExpr
+  / "~u" ws+ s:StringLiteral { return url(rex(s)); }
+  / "~uc" ws+ s:StringLiteral { return url(rex(s, "")); }
   / "~websocket" { return websocketFilter; }
-  / s:StringLiteral { return url(s); }
+  / s:StringLiteral { return url(rex(s)); }
+
+/* HTTP timestamp comparisons (~dt family). The comparison operator must be
+   separated from the filter name by whitespace, mirroring the backend parser.
+   The fixed "YYYY-MM-DD HH:MM:SS[.ffffff][Z|±HH:MM]" form consumes its own
+   internal space so it cannot be mistaken for an implicit AND separator. */
+TimestampExpr
+  = op:TimestampOp ws+ cmp:Comparator ws* value:DateTimeValue
+    { return httpTime(op, cmp, value); }
+
+TimestampOp
+  = "~dtqs" { return "request start time"; }
+  / "~dtqe" { return "request end time"; }
+  / "~dtss" { return "response start time"; }
+  / "~dtse" { return "response end time"; }
+  / "~dtq" { return "request timestamp"; }
+  / "~dts" { return "response timestamp"; }
+  / "~dt" { return "any http timestamp"; }
+
+Comparator "comparator"
+  = "!=" { return "!="; }
+  / ">=" { return ">="; }
+  / "<=" { return "<="; }
+  / "=" { return "="; }
+  / ">" { return ">"; }
+  / "<" { return "<"; }
+
+DateTimeValue "datetime"
+  = ["] body:DatetimeBody ["] { return body; }
+  / ['] body:DatetimeBody ['] { return body; }
+  / body:DatetimeBody { return body; }
+
+DatetimeBody
+  = date:Date rest:DatetimeRest?
+    { return rest === null ? date : date + rest; }
+
+Date
+  = y:Digits4 "-" m:Digits2 "-" d:Digits2
+    { return y + "-" + m + "-" + d; }
+
+DatetimeRest
+  = sep:[T ] time:ClockTime zone:Zone?
+    { return sep + time + (zone === null ? "" : zone); }
+
+ClockTime
+  = h:Digits2 ":" m:Digits2 ":" s:Digits2 frac:Fraction?
+    { return h + ":" + m + ":" + s + (frac === null ? "" : frac); }
+
+Fraction
+  = "." digits:[0-9]+ { return "." + digits.join(""); }
+
+Zone
+  = "Z" { return "Z"; }
+  / sign:[+-] h:Digits2 ":" m:Digits2 { return sign + h + ":" + m; }
+
+Digits4
+  = a:[0-9] b:[0-9] c:[0-9] d:[0-9] { return a + b + c + d; }
+
+Digits2
+  = a:[0-9] b:[0-9] { return a + b; }
 
 IntegerLiteral "integer"
   = ['"]? digits:[0-9]+ ['"]? { return parseInt(digits.join(""), 10); }
@@ -405,7 +498,7 @@ SingleStringChar
   / "\\" char:EscapeSequence { return char; }
 
 UnquotedStringChar
-  = !ws char:. { return char; }
+  = !(ws / cc) char:. { return char; }
 
 EscapeSequence
   = ['"\\]

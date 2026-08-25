@@ -1,4 +1,12 @@
 import io
+import json
+import os
+import re
+import subprocess
+import sys
+from contextlib import contextmanager
+from datetime import datetime
+from datetime import timezone as dt_timezone
 from unittest.mock import patch
 
 import pytest
@@ -8,6 +16,17 @@ from mitmproxy import http
 from mitmproxy.flowfilter import FAnd
 from mitmproxy.flowfilter import TFilter
 from mitmproxy.test import tflow
+
+
+@contextmanager
+def _ignore_case(flag: bool):
+    """Temporarily control the global case-insensitivity flag."""
+    old = flowfilter.maybe_ignore_case
+    flowfilter.maybe_ignore_case = re.IGNORECASE if flag else re.NOFLAG
+    try:
+        yield
+    finally:
+        flowfilter.maybe_ignore_case = old
 
 
 class TestParsing:
@@ -129,6 +148,38 @@ class TestParsing:
             ("~meta foo", "flow metadata matches /foo/im"),
             ("~marker red", "marker matches /red/i"),
             ("~comment note", "comment matches /note/im"),
+            # case-sensitive variants keep their other flags and lose "i".
+            ("~bc rex", "body matches /rex/s"),
+            ("~bqc rex", "body request matches /rex/s"),
+            ("~bsc rex", "body response matches /rex/s"),
+            ("~tc content", "content type matches /content/"),
+            ("~tqc content", "req. content type matches /content/"),
+            ("~tsc content", "resp. content type matches /content/"),
+            ("~hc rex", "header matches /rex/m"),
+            ("~hqc rex", "req. header matches /rex/m"),
+            ("~hsc rex", "resp. header matches /rex/m"),
+            ("~mc get", "method matches /get/"),
+            ("~dc example.com", "domain matches /example.com/"),
+            ("~uc foo", "url matches /foo/"),
+            ("~srcc 127.0.0.1", "source address matches /127.0.0.1/"),
+            ("~dstc example.com:443", "destination address matches /example.com:443/"),
+            ("~metac foo", "flow metadata matches /foo/m"),
+            ("~markerc red", "marker matches /red/"),
+            ("~commentc note", "comment matches /note/m"),
+            # HTTP timestamp comparisons
+            ("~dt >= 2026-05-20", "http timestamp >= 2026-05-20"),
+            ("~dtq < 2026-05-20 12:00:00", "request timestamp < 2026-05-20 12:00:00"),
+            ("~dts != 2026-05-20", "response timestamp != 2026-05-20"),
+            (
+                "~dtqs <= 2026-05-20T12:30:45Z",
+                "request start time <= 2026-05-20T12:30:45Z",
+            ),
+            ("~dtqe = 2026-05-20", "request end time = 2026-05-20"),
+            ("~dtss > 2026-05-20", "response start time > 2026-05-20"),
+            (
+                '~dtse <= "2026-05-20 12:30:45.5+02:00"',
+                "response end time <= 2026-05-20 12:30:45.5+02:00",
+            ),
             ("~c 404", "response code is 404"),
             (
                 "(~u foobar & ~h voing)",
@@ -142,6 +193,314 @@ class TestParsing:
     )
     def test_str_implementations(self, expr: str, expected: str):
         assert str(flowfilter.parse(expr)) == expected
+
+
+class TestCaseSensitiveRegexVariants:
+    def req(self):
+        return tflow.tflow()
+
+    def q(self, q, o):
+        return flowfilter.parse(q)(o)
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "b",
+            "bq",
+            "bs",
+            "t",
+            "tq",
+            "ts",
+            "h",
+            "hq",
+            "hs",
+            "m",
+            "d",
+            "u",
+            "src",
+            "dst",
+            "meta",
+            "marker",
+            "comment",
+        ],
+    )
+    def test_variant_exists_and_parses(self, code):
+        variants = {cls.code: cls for cls in flowfilter.filter_rex}
+        assert f"{code}c" in variants
+        assert code in variants
+        base = flowfilter.parse(f"~{code} foo")
+        variant = flowfilter.parse(f"~{code}c foo")
+        assert isinstance(variant, type(base))
+
+    def test_no_variants_for_non_regex_filters(self):
+        codes = {cls.code for cls in flowfilter.filter_rex}
+        assert "cc" not in codes  # ~c is a response code filter
+        assert not any(
+            code.endswith("qc") and len(code) > 3 and code[:-1] not in codes
+            for code in codes
+        )
+
+    def test_variant_flags(self):
+        """The c variant only differs by the absence of re.IGNORECASE."""
+        variants = {cls.code: cls for cls in flowfilter.filter_rex}
+        for code in ["b", "bq", "bs", "t", "tq", "ts", "h", "hq", "hs", "m", "d", "u", "src", "dst", "meta", "marker", "comment"]:
+            base = flowfilter.parse(f"~{code} foo")
+            variant = flowfilter.parse(f"~{code}c foo")
+            assert not variant.re.flags & re.IGNORECASE
+            assert base.re.flags & ~re.IGNORECASE == variant.re.flags & ~re.IGNORECASE
+            assert variants[code].flags == variants[f"{code}c"].flags
+
+    def test_default_is_case_insensitive(self):
+        with _ignore_case(True):
+            q = self.req()
+            q.request.path = "/FooBar"
+            assert self.q("~u foobar", q)
+            assert self.q("~u FooBar", q)
+            # The c variant only matches the exact case.
+            assert self.q("~uc FooBar", q)
+            assert not self.q("~uc FOOBAR", q)
+
+    def test_variant_forces_case_sensitivity(self):
+        """~uc stays case-sensitive even if global insensitive matching is on."""
+        with _ignore_case(True):
+            q = self.req()
+            q.request.path = "/FooBar"
+            assert self.q("~u foobar", q)
+            assert not self.q("~uc foobar", q)
+            assert self.q("~uc FooBar", q)
+
+    def test_legacy_global_flag_still_applies_to_plain_operators(self):
+        with _ignore_case(False):
+            q = self.req()
+            q.request.path = "/FooBar"
+            # Legacy MITMPROXY_CASE_SENSITIVE_FILTERS=1 behaviour: plain
+            # operators become case-sensitive.
+            assert self.q("~u FooBar", q)
+            assert not self.q("~u foobar", q)
+            # The c variants are unaffected.
+            assert self.q("~uc FooBar", q)
+            assert not self.q("~uc foobar", q)
+
+    def test_inherited_flags_are_kept(self, monkeypatch):
+        monkeypatch.setenv("MITMPROXY_CASE_SENSITIVE_FILTERS", "0")
+        s = tflow.tflow(resp=True)
+        s.request.headers["X-Sent"] = "Yes"
+        s.response.headers["X-Header"] = "QValue"
+        # Headers remain multiline ...
+        assert self.q("~hc 'X-Sent'", s)
+        assert self.q(r"~hqc '^X-Sent: Yes\r?$'", s)
+        assert not self.q("~hqc 'x-sent'", s)
+        assert self.q(r"~hsc '^X-Header: QValue\r?$'", s)
+        # ... bodies keep DOTALL.
+        s.request.content = b"a\nb"
+        assert self.q("~bq 'a.b'", s)
+        assert self.q("~bqc 'a.b'", s)
+        assert not self.q("~bqc 'A.B'", s)
+
+    @pytest.mark.parametrize(
+        ("env_value", "expected"),
+        [
+            (
+                None,
+                {"plain_lower": True, "cs_lower": False, "cs_upper": True},
+            ),
+            (
+                "1",
+                {"plain_lower": False, "cs_lower": False, "cs_upper": True},
+            ),
+            (
+                "0",
+                {"plain_lower": True, "cs_lower": False, "cs_upper": True},
+            ),
+        ],
+    )
+    def test_env_var_end_to_end(self, env_value, expected):
+        """MITMPROXY_CASE_SENSITIVE_FILTERS keeps steering plain operators.
+
+        The flag is read at import time, so this runs a fresh interpreter.
+        """
+        code = f"""
+import json
+from mitmproxy import flowfilter
+from mitmproxy.test import tflow
+
+f = tflow.tflow()
+f.request.path = "/FooBar"
+print(json.dumps({{
+    "plain_lower": bool(flowfilter.parse("~u foobar")(f)),
+    "cs_lower": bool(flowfilter.parse("~uc foobar")(f)),
+    "cs_upper": bool(flowfilter.parse("~uc FooBar")(f)),
+}}))
+"""
+        env = dict(os.environ)
+        if env_value is None:
+            env.pop("MITMPROXY_CASE_SENSITIVE_FILTERS", None)
+        else:
+            env["MITMPROXY_CASE_SENSITIVE_FILTERS"] = env_value
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+        assert json.loads(proc.stdout.strip().splitlines()[-1]) == expected
+
+
+class TestHTTPTimestampFilters:
+    ts_req_start = datetime(2026, 5, 20, 12, 30, tzinfo=dt_timezone.utc).timestamp()
+
+    @staticmethod
+    def iso(ts: float) -> str:
+        return (
+            datetime.fromtimestamp(ts, dt_timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    def resp_flow(self) -> http.HTTPFlow:
+        f = tflow.tflow(resp=True)
+        f.request.timestamp_start = self.ts_req_start
+        f.request.timestamp_end = None  # incomplete request
+        f.response.timestamp_start = datetime(2026, 5, 21, tzinfo=dt_timezone.utc).timestamp()
+        f.response.timestamp_end = datetime(2026, 6, 11, tzinfo=dt_timezone.utc).timestamp()
+        return f
+
+    def q(self, expr, f):
+        return bool(flowfilter.parse(expr)(f))
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "~dt >= 2026-05-20",
+            "~dtq >= 2026-05-20",
+            "~dts >= 2026-05-20",
+            "~dtqs >= 2026-05-20",
+            "~dtqe >= 2026-05-20",
+            "~dtss >= 2026-05-20",
+            "~dtse >= 2026-05-20",
+            '~dtqs >= "2026-05-20"',
+        ],
+    )
+    def test_parse_all_operators(self, expr):
+        assert flowfilter.parse(expr)
+
+    @pytest.mark.parametrize("comparator", ["=", "!=", ">", ">=", "<", "<="])
+    def test_parse_all_comparators(self, comparator):
+        assert flowfilter.parse(f"~dtqs {comparator} 2026-05-20")
+
+    def test_request_vs_response_fields(self):
+        f = self.resp_flow()
+        assert self.q(f"~dtqs = {self.iso(self.ts_req_start)}", f)
+        assert not self.q(f"~dtss = {self.iso(self.ts_req_start)}", f)
+        assert not self.q("~dtqe != 1970-01-01", f)  # request end missing
+        assert self.q("~dtse > 2026-06-10", f)
+        assert not self.q("~dtqs > 2026-06-10", f)
+
+    def test_aggregates_match_any_timestamp(self):
+        f = self.resp_flow()
+        # Only the response timestamps satisfy these.
+        assert self.q("~dt >= 2026-05-21", f)
+        assert self.q("~dts >= 2026-05-21", f)
+        assert not self.q("~dtqs >= 2026-05-21", f)
+        assert self.q("~dtq < 2026-05-21", f)
+        # Aggregates match if ANY of their timestamps compares successfully.
+        assert self.q("~dtq != 1970-01-01", f)
+        assert not self.q("~dtqe != 1970-01-01", f)
+
+    def test_comparator_boundaries(self):
+        f = self.resp_flow()
+        start = f.response.timestamp_start
+        exact = f"~dtss = {self.iso(start)}"
+        assert self.q(exact, f)
+        assert self.q(f"~dtss <= {self.iso(start)}", f)
+        assert self.q(f"~dtss >= {self.iso(start)}", f)
+        assert not self.q(f"~dtss < {self.iso(start)}", f)
+        assert not self.q(f"~dtss > {self.iso(start)}", f)
+        assert self.q(f"~dtss <= {self.iso(start + 1)}", f)
+        assert not self.q(f"~dtss < {self.iso(start - 1)}", f)
+        assert self.q(f"~dtss > {self.iso(start - 1)}", f)
+
+    def test_date_only_is_local_midnight(self):
+        midnight_local = datetime(2026, 5, 21).astimezone().timestamp()
+        f = tflow.tflow()
+        f.request.timestamp_start = midnight_local
+        assert self.q("~dtqs = 2026-05-21", f)
+        assert self.q("~dtqs >= 2026-05-21 00:00:00", f)
+        assert not self.q("~dtqs > 2026-05-21 00:00:00", f)
+        assert not self.q("~dtqs < 2026-05-20T23:59:59Z", f) or (
+            datetime.fromtimestamp(midnight_local, dt_timezone.utc).date().isoformat()
+            == "2026-05-20"
+        )
+
+    def test_separator_forms_and_fractional_seconds(self):
+        f = tflow.tflow()
+        f.request.timestamp_start = datetime(
+            2026, 5, 20, 12, 30, 45, 123456, dt_timezone.utc
+        ).timestamp()
+        assert self.q("~dtqs = 2026-05-20T12:30:45.123456Z", f)
+        assert self.q('~dtqs = "2026-05-20 12:30:45.123456+00:00"', f)
+        assert self.q("~dtqs = 2026-05-20 14:30:45.123456+02:00", f)
+        assert not self.q("~dtqs = 2026-05-20T12:30:45.000001Z", f)
+
+    def test_timezones_are_normalized(self):
+        f = tflow.tflow()
+        f.request.timestamp_start = self.ts_req_start
+        assert self.q("~dtqs = 2026-05-20T12:30:00Z", f)
+        assert self.q("~dtqs = 2026-05-20T14:30:00+02:00", f)
+        assert self.q("~dtqs = 2026-05-20T09:30:00-03:00", f)
+        # Timezone-less input is interpreted as local time.
+        local_equiv = datetime.fromtimestamp(self.ts_req_start).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        assert self.q(f"~dtqs = {local_equiv}", f)
+
+    def test_missing_timestamps_never_match(self):
+        f = tflow.tflow()  # no response at all
+        for op in ["=", "!=", ">", ">=", "<", "<="]:
+            assert not self.q(f"~dts {op} 1970-01-01", f)
+            assert not self.q(f"~dtss {op} 1970-01-01", f)
+            assert not self.q(f"~dtse {op} 1970-01-01", f)
+
+    def test_missing_end_skipped_by_aggregates(self):
+        f = self.resp_flow()
+        f.request.timestamp_end = None
+        assert not self.q("~dtqe != 1970-01-01", f)
+        # ... but other request timestamps still count.
+        assert self.q("~dtq != 1970-01-01", f)
+
+    def test_non_http_flows_do_not_match(self):
+        flows = [
+            tflow.ttcpflow(),
+            tflow.tudpflow(),
+            tflow.tdnsflow(),
+            tflow.tdummyflow(),
+        ]
+        for f in flows:
+            for op in ["~dt", "~dtq", "~dts", "~dtqs", "~dtqe", "~dtss", "~dtse"]:
+                assert not self.q(f"{op} >= 1970-01-01", f), op
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "~dtqs",
+            "~dtqs 2026-05-20",
+            "~dtqs == 2026-05-20",
+            "~dtqs => 2026-05-20",
+            "~dtqs > yesterday",
+            "~dtqs > 2026-13-40",
+            "~dtqs > 2026-5-20",
+            "~dtqs > 2026-05-20T99:00:00",
+        ],
+    )
+    def test_malformed_expressions_fail_cleanly(self, expr):
+        with pytest.raises(ValueError, match="Invalid filter expression"):
+            flowfilter.parse(expr)
+
+    def test_help_contains_entries(self):
+        commands = [cmd for cmd, _ in flowfilter.help]
+        for code in ["~dt", "~dtq", "~dts", "~dtqs", "~dtqe", "~dtss", "~dtse"]:
+            assert any(cmd.split(" ")[0] == code for cmd in commands), code
 
 
 class TestMatchingHTTPFlow:

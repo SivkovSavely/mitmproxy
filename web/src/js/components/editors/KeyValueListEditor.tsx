@@ -12,6 +12,7 @@ type RowProps = {
     onEditDone: (newItem: Item) => void;
     onClickEmptyArea: () => void;
     onTabNext: () => void;
+    rowAction?: React.ReactNode;
 };
 
 class Row extends Component<RowProps> {
@@ -51,6 +52,18 @@ class Row extends Component<RowProps> {
                     placeholder="empty"
                     selectAllOnClick={true}
                 />
+                {this.props.rowAction && (
+                    // The action is fully isolated from the editing behavior
+                    // of the surrounding row.
+                    <span
+                        className="kv-row-action"
+                        onClick={(e) => e.stopPropagation()}
+                        onKeyDown={(e) => e.stopPropagation()}
+                        onMouseDown={(e) => e.stopPropagation()}
+                    >
+                        {this.props.rowAction}
+                    </span>
+                )}
             </div>
         );
     };
@@ -73,6 +86,8 @@ type KeyValueListProps = {
     onChange: (newList: Item[]) => void;
     data?: Item[];
     className?: string;
+    /** Optional action node rendered at the end of every row. */
+    rowAction?: (item: Item) => React.ReactNode;
 };
 
 type KeyValueListState = {
@@ -114,6 +129,7 @@ export default class KeyValueListEditor extends Component<
                     onEditDone={(newItem) => this.onEditDone(row, newItem)}
                     onClickEmptyArea={() => this.onClickEmptyArea(row)}
                     onTabNext={() => this.onTabNext(row)}
+                    rowAction={this.props.rowAction?.(h)}
                     ref={(e) => {
                         this.rowRefs[row] = e;
                     }}
