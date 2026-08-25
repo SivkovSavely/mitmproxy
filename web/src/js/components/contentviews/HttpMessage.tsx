@@ -133,10 +133,12 @@ function HttpMessageView({ flow, message, startEdit }: HttpMessageViewProps) {
             `${contentViewData.view_name} ${contentViewData.description}`.trimEnd();
     }
 
-    // The JSON view is fetched with maxLines + 1 lines, so more lines than
-    // that indicate the body was cut off.
+    // The JSON and AI Stream views are fetched with maxLines + 1 lines, so more
+    // lines than that indicate the body was cut off.
     const jsonLines =
-        contentViewData?.view_name === "JSON"
+        contentViewData &&
+        (contentViewData.view_name === "JSON" ||
+            contentViewData.view_name === "AI Stream")
             ? contentViewData.text.split("\n")
             : [];
     const jsonTruncated = jsonLines.length > maxLines;

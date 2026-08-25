@@ -313,6 +313,23 @@ describe("HttpMessage JSON view", () => {
         await expectJsonEditor('{"b": {"c": 3}}');
     });
 
+    test("renders AI Stream view read-only in json mode", async () => {
+        fetchMock.mockResponse(
+            JSON.stringify({
+                text: '{"protocol": "openai-chat-completions"}',
+                view_name: "AI Stream",
+                description: "",
+                syntax_highlight: "yaml",
+            }),
+        );
+
+        const tflow = TFlow();
+        render(<HttpMessage flow={tflow} message={tflow.response} />);
+
+        await expectJsonEditor('{"protocol": "openai-chat-completions"}');
+        expect(screen.queryByText("Show more")).toBeNull();
+    });
+
     test("switching Auto -> JSON uses the json viewer despite the yaml hint", async () => {
         fetchMock.mockResponses(
             JSON.stringify({

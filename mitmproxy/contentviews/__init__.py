@@ -24,6 +24,7 @@ from ._registry import ContentviewRegistry
 from ._utils import ContentviewMessage
 from ._utils import get_data
 from ._utils import make_metadata
+from ._view_aistream import ai_stream
 from ._view_css import css
 from ._view_dns import dns
 from ._view_graphql import graphql
@@ -131,6 +132,7 @@ def reencode_message(
 
 
 _views: list[Contentview] = [
+    ai_stream,
     css,
     dns,
     graphql,
