@@ -10,6 +10,8 @@ import os.path
 import re
 import secrets
 import sys
+import tempfile
+import zipfile
 from collections.abc import Callable
 from collections.abc import Sequence
 from io import BytesIO
@@ -755,6 +757,70 @@ class FlowContentView(RequestHandler):
             self.write(self.message_to_json(content_view, message, flow, max_lines))
 
 
+class FlowsDownload(RequestHandler):
+    def post(self) -> None:
+        data = self.json
+        if not isinstance(data, dict):
+            raise APIError(400, "Invalid JSON body.")
+        flow_ids = data.get("flow_ids")
+        parts = data.get("parts")
+        if (
+            not isinstance(flow_ids, list)
+            or not flow_ids
+            or not all(isinstance(x, str) for x in flow_ids)
+        ):
+            raise APIError(400, "flow_ids must be a non-empty list of strings.")
+        if (
+            not isinstance(parts, list)
+            or not parts
+            or len(set(parts)) != len(parts)
+            or any(p not in ("request", "response") for p in parts)
+        ):
+            raise APIError(400, 'parts must be "request", "response", or both.')
+
+        flows: list[HTTPFlow] = []
+        for flow_id in flow_ids:
+            f = self.view.get_by_id(flow_id)
+            if f is None:
+                raise APIError(404, f"Flow not found: {flow_id}")
+            if not isinstance(f, HTTPFlow):
+                raise APIError(400, f"Not an HTTP flow: {flow_id}")
+            flows.append(f)
+
+        # Deterministic, collision-free entry names based on visible position + flow id + part.
+        entries: list[tuple[str, bytes]] = []
+        for i, f in enumerate(flows):
+            for part in parts:
+                message = getattr(f, part)
+                if message is None:
+                    continue
+                content = message.get_content(strict=False)
+                if not content:
+                    continue
+                ext = ".bin"
+                if ctype := message.headers.get("Content-Type"):
+                    ext = (
+                        mimetypes.guess_extension(ctype.split(";")[0].strip()) or ".bin"
+                    )
+                entries.append((f"{i + 1:04d}-{f.id}-{part}{ext}", content))
+
+        if not entries:
+            raise APIError(400, "No downloadable message bodies in selection.")
+
+        self.set_header("Content-Type", "application/zip")
+        self.set_header(
+            "Content-Disposition", "attachment; filename=mitmweb-bodies.zip"
+        )
+        # Spool the archive to disk instead of buffering arbitrarily large bodies in memory.
+        with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as tmp:
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+                for name, content in entries:
+                    zf.writestr(name, content)
+            tmp.seek(0)
+            while chunk := tmp.read(64 * 1024):
+                self.write(chunk)
+
+
 class Commands(RequestHandler):
     def get(self) -> None:
         commands = {}
@@ -925,6 +991,7 @@ handlers = [
     (r"/flows/dump", DumpFlows),
     (r"/flows/resume", ResumeFlows),
     (r"/flows/kill", KillFlows),
+    (r"/flows/download", FlowsDownload),
     (r"/flows/(?P<flow_id>[0-9a-f\-]+)", FlowHandler),
     (r"/flows/(?P<flow_id>[0-9a-f\-]+)/resume", ResumeFlow),
     (r"/flows/(?P<flow_id>[0-9a-f\-]+)/kill", KillFlow),

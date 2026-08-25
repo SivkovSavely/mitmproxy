@@ -6,9 +6,13 @@ import Icon from "./Icon";
 
 export const Divider = () => <li role="separator" className="menu-divider" />;
 
-type MenuItemProps = {
+type MenuItemProps = Omit<
+    React.ComponentPropsWithoutRef<"a">,
+    "onClick" | "href" | "disabled"
+> & {
     onClick: () => void;
-    children: React.ReactNode;
+    // Rendered as a plain [disabled] attribute for styling/selection.
+    disabled?: boolean;
 };
 
 export function MenuItem({ onClick, children, ...attrs }: MenuItemProps) {

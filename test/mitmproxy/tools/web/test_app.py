@@ -1,10 +1,12 @@
 import gzip
 import importlib
+import io
 import json
 import logging
 import os
 import tempfile
 import urllib.parse
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -105,6 +107,14 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
             headers={"Content-Type": "application/json"},
         )
 
+    def post_json(self, url: str, data: dict) -> httpclient.HTTPResponse:
+        return self.fetch(
+            url,
+            method="POST",
+            body=json.dumps(data),
+            headers={"Content-Type": "application/json"},
+        )
+
     def test_index(self):
         response = self.fetch("/")
         assert response.code == 200
@@ -149,6 +159,138 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
 
     def test_flows_dump_filter_error(self):
         resp = self.fetch("/flows/dump?filter=[")
+        assert resp.code == 400
+
+    def test_flows_download(self):
+        f2 = tflow.tflow(resp=True)
+        f2.id = "44"
+        f2.request.content = b"request-two"
+        f2.request.headers["Content-Type"] = "text/plain"
+        f2.response.content = bytes(range(256))
+        self.view.add([f2])
+
+        resp = self.post_json(
+            "/flows/download",
+            {"flow_ids": ["42", "44"], "parts": ["request", "response"]},
+        )
+        assert resp.code == 200
+        assert resp.headers["Content-Type"] == "application/zip"
+        assert resp.headers["Content-Disposition"] == (
+            "attachment; filename=mitmweb-bodies.zip"
+        )
+        zf = zipfile.ZipFile(io.BytesIO(resp.body))
+        assert zf.namelist() == [
+            "0001-42-request.bin",  # no Content-Type: .bin fallback
+            "0001-42-response.bin",
+            "0002-44-request.txt",
+            "0002-44-response.bin",  # binary round-trips exactly
+        ]
+        assert zf.read("0001-42-request.bin") == b"foo\nbar"
+        assert zf.read("0001-42-response.bin") == b"message"
+        assert zf.read("0002-44-request.txt") == b"request-two"
+        assert zf.read("0002-44-response.bin") == bytes(range(256))
+
+    def test_flows_download_deterministic_names(self):
+        for fid in ["50", "51"]:
+            f = tflow.tflow(resp=True)
+            f.id = fid
+            f.request.content = b"identical"
+            f.request.path = "/identical"
+            f.response.headers["Content-Type"] = "application/json"
+            self.view.add([f])
+
+        r1 = self.post_json(
+            "/flows/download", {"flow_ids": ["50", "51"], "parts": ["response"]}
+        )
+        r2 = self.post_json(
+            "/flows/download", {"flow_ids": ["50", "51"], "parts": ["response"]}
+        )
+        names = zipfile.ZipFile(io.BytesIO(r1.body)).namelist()
+        assert names == [
+            "0001-50-response.json",
+            "0002-51-response.json",
+        ]
+        assert zipfile.ZipFile(io.BytesIO(r2.body)).namelist() == names
+
+    def test_flows_download_parts(self):
+        f_nobody = tflow.tflow(resp=True)
+        f_nobody.id = "60"
+        f_nobody.request.content = b""
+        f_nobody.response.content = b"resp-body"
+        f_noresp = tflow.tflow(resp=False)
+        f_noresp.id = "61"
+        f_noresp.request.content = b"req-body"
+        self.view.add([f_nobody, f_noresp])
+
+        # request-only mode: empty request bodies contribute nothing
+        resp = self.post_json(
+            "/flows/download", {"flow_ids": ["60", "61"], "parts": ["request"]}
+        )
+        assert resp.code == 200
+        zf = zipfile.ZipFile(io.BytesIO(resp.body))
+        assert zf.namelist() == ["0002-61-request.bin"]
+        assert zf.read("0002-61-request.bin") == b"req-body"
+
+        # response-only mode: flows without a response contribute nothing
+        resp = self.post_json(
+            "/flows/download", {"flow_ids": ["60", "61"], "parts": ["response"]}
+        )
+        assert resp.code == 200
+        zf = zipfile.ZipFile(io.BytesIO(resp.body))
+        assert zf.namelist() == ["0001-60-response.bin"]
+
+        # combined mode skips absent and empty parts
+        resp = self.post_json(
+            "/flows/download",
+            {"flow_ids": ["60", "61"], "parts": ["request", "response"]},
+        )
+        assert resp.code == 200
+        zf = zipfile.ZipFile(io.BytesIO(resp.body))
+        assert zf.namelist() == ["0001-60-response.bin", "0002-61-request.bin"]
+
+    def test_flows_download_rejects_unknown_flow(self):
+        resp = self.post_json(
+            "/flows/download", {"flow_ids": ["unknown-id"], "parts": ["request"]}
+        )
+        assert resp.code == 404
+
+    def test_flows_download_rejects_non_http_flow(self):
+        tcp = tflow.ttcpflow()
+        tcp.id = "70"
+        self.view.add([tcp])
+        resp = self.post_json(
+            "/flows/download", {"flow_ids": ["70"], "parts": ["request"]}
+        )
+        assert resp.code == 400
+
+    def test_flows_download_rejects_malformed_input(self):
+        for data in [
+            {},
+            {"parts": ["request"]},
+            {"flow_ids": "42", "parts": ["request"]},
+            {"flow_ids": [], "parts": ["request"]},
+            {"flow_ids": [42], "parts": ["request"]},
+            {"flow_ids": ["42"]},
+            {"flow_ids": ["42"], "parts": []},
+            {"flow_ids": ["42"], "parts": "request"},
+            {"flow_ids": ["42"], "parts": ["request", "bogus"]},
+            {"flow_ids": ["42"], "parts": ["request", "request"]},
+        ]:
+            resp = self.post_json("/flows/download", data)
+            assert resp.code == 400, data
+
+        resp = self.fetch(
+            "/flows/download",
+            method="POST",
+            body="!!",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.code == 400
+
+    def test_flows_download_rejects_empty_archive(self):
+        resp = self.post_json(
+            "/flows/download", {"flow_ids": ["43"], "parts": ["response"]}
+        )
         assert resp.code == 400
 
     def test_clear(self):

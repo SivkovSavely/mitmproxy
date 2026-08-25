@@ -19,6 +19,7 @@ import {
 } from "../../ducks/flows";
 import Dropdown, { MenuItem } from "../common/Dropdown";
 import { copy } from "../../flow/export";
+import { fetchApi } from "../../utils";
 import type { Flow } from "../../flow";
 
 import type { JSX } from "react";
@@ -29,7 +30,14 @@ export default function FlowMenu(): JSX.Element {
     const dispatch = useAppDispatch();
 
     const selectedFlows = useAppSelector((state) => state.flows.selected);
-    const flow = selectedFlows[0];
+    // ctrl-/shift-click selection order is not guaranteed to match the visible
+    // order, so derive the ordered selection from the current view.
+    const view = useAppSelector((state) => state.flows.view);
+    const selectedIds = useAppSelector((state) => state.flows.selectedIds);
+    const orderedFlows = React.useMemo(
+        () => view.filter((f) => selectedIds.has(f.id)),
+        [view, selectedIds],
+    );
 
     const canResumeOrKillAny = selectedFlows.some(canResumeOrKill);
 
@@ -86,8 +94,8 @@ export default function FlowMenu(): JSX.Element {
 
             <div className="menu-group">
                 <div className="menu-content">
-                    <DownloadButton flow={flow} />
-                    <ExportButton flow={flow} />
+                    <DownloadButton flows={orderedFlows} />
+                    <ExportButton flows={orderedFlows} />
                 </div>
                 <div className="menu-legend">Export</div>
             </div>
@@ -127,12 +135,76 @@ const openInNewTab = (url: string) => {
     if (newWindow) newWindow.opener = null;
 };
 
-function DownloadButton({ flow }: { flow: Flow }) {
-    const hasSingleFlowSelected = useAppSelector(
-        (state) => state.flows.selected.length === 1,
+async function downloadBodies(
+    flows: Flow[],
+    parts: ("request" | "response")[],
+): Promise<void> {
+    try {
+        const response = await fetchApi.post("/flows/download", {
+            flow_ids: flows.map((f) => f.id),
+            parts,
+        });
+        if (!response.ok) {
+            throw new Error(await response.text());
+        }
+        const url = URL.createObjectURL(await response.blob());
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "mitmweb-bodies.zip";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+    } catch (err) {
+        alert(err);
+    }
+}
+
+function MultiDownloadDropdown({ flows }: { flows: Flow[] }) {
+    const allHttp = flows.every((f) => f.type === "http");
+    const hasRequests = flows.some(
+        (f) => f.type === "http" && !!f.request.contentLength,
+    );
+    const hasResponses = flows.some(
+        (f) => f.type === "http" && !!f.response?.contentLength,
     );
 
-    if (flow.type !== "http")
+    return (
+        <Dropdown
+            text={
+                <Button icon="download" onClick={() => 1} disabled={!allHttp}>
+                    Download▾
+                </Button>
+            }
+            options={{ placement: "bottom-start" }}
+        >
+            <MenuItem
+                disabled={!allHttp || !hasRequests}
+                onClick={() => downloadBodies(flows, ["request"])}
+            >
+                Download requests
+            </MenuItem>
+            <MenuItem
+                disabled={!allHttp || !hasResponses}
+                onClick={() => downloadBodies(flows, ["response"])}
+            >
+                Download responses
+            </MenuItem>
+            <MenuItem
+                disabled={!allHttp || (!hasRequests && !hasResponses)}
+                onClick={() => downloadBodies(flows, ["request", "response"])}
+            >
+                Download requests and responses
+            </MenuItem>
+        </Dropdown>
+    );
+}
+
+function DownloadButton({ flows }: { flows: Flow[] }) {
+    if (flows.length > 1) return <MultiDownloadDropdown flows={flows} />;
+
+    const flow = flows[0];
+    if (!flow || flow.type !== "http")
         return (
             <Button icon="download" onClick={() => 0} disabled>
                 Download
@@ -146,7 +218,6 @@ function DownloadButton({ flow }: { flow: Flow }) {
                 onClick={() =>
                     openInNewTab(MessageUtils.getContentURL(flow, flow.request))
                 }
-                disabled={!hasSingleFlowSelected}
             >
                 Download
             </Button>
@@ -161,7 +232,6 @@ function DownloadButton({ flow }: { flow: Flow }) {
                     onClick={() =>
                         openInNewTab(MessageUtils.getContentURL(flow, response))
                     }
-                    disabled={!hasSingleFlowSelected}
                 >
                     Download
                 </Button>
@@ -171,11 +241,7 @@ function DownloadButton({ flow }: { flow: Flow }) {
             return (
                 <Dropdown
                     text={
-                        <Button
-                            icon="download"
-                            onClick={() => 1}
-                            disabled={!hasSingleFlowSelected}
-                        >
+                        <Button icon="download" onClick={() => 1}>
                             Download▾
                         </Button>
                     }
@@ -207,10 +273,8 @@ function DownloadButton({ flow }: { flow: Flow }) {
     return null;
 }
 
-function ExportButton({ flow }: { flow: Flow }) {
-    const hasSingleFlowSelected = useAppSelector(
-        (state) => state.flows.selected.length === 1,
-    );
+function ExportButton({ flows }: { flows: Flow[] }) {
+    const enabled = flows.length > 0 && flows.every((f) => f.type === "http");
     return (
         <Dropdown
             className=""
@@ -219,24 +283,26 @@ function ExportButton({ flow }: { flow: Flow }) {
                     title="Export flow."
                     icon="export"
                     onClick={() => 1}
-                    disabled={flow.type !== "http" || !hasSingleFlowSelected}
+                    disabled={!enabled}
                 >
                     Export▾
                 </Button>
             }
             options={{ placement: "bottom-start" }}
         >
-            <MenuItem onClick={() => copy(flow, "raw_request")}>
+            <MenuItem onClick={() => copy(flows, "raw_request")}>
                 Copy raw request
             </MenuItem>
-            <MenuItem onClick={() => copy(flow, "raw_response")}>
+            <MenuItem onClick={() => copy(flows, "raw_response")}>
                 Copy raw response
             </MenuItem>
-            <MenuItem onClick={() => copy(flow, "raw")}>
+            <MenuItem onClick={() => copy(flows, "raw")}>
                 Copy raw request and response
             </MenuItem>
-            <MenuItem onClick={() => copy(flow, "curl")}>Copy as cURL</MenuItem>
-            <MenuItem onClick={() => copy(flow, "httpie")}>
+            <MenuItem onClick={() => copy(flows, "curl")}>
+                Copy as cURL
+            </MenuItem>
+            <MenuItem onClick={() => copy(flows, "httpie")}>
                 Copy as HTTPie
             </MenuItem>
         </Dropdown>
