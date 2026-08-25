@@ -916,6 +916,27 @@ class ScriptSource(RequestHandler):
             )
         )
 
+    def put(self):
+        path = self.get_query_argument("path")
+        fullpath = os.path.expanduser(path)
+        known = {s["fullpath"] for s in self.master.scripts_state()}
+        if fullpath not in known:
+            raise APIError(404, "Unknown script")
+        body: bytes = self.request.body
+        if len(body) > self.MAX_SOURCE_SIZE:
+            raise APIError(400, "Script too large")
+        try:
+            source = body.decode("utf-8")
+        except UnicodeDecodeError:
+            raise APIError(400, "Script must be UTF-8") from None
+        try:
+            with open(fullpath, "w", encoding="utf-8") as f:
+                f.write(source)
+        except OSError:
+            raise APIError(400, "Cannot write script")
+        # The script loader picks up the change on its next reload interval.
+        self.write(dict(path=path))
+
 
 class State(RequestHandler):
     # Separate method for testability.

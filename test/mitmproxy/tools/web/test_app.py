@@ -632,6 +632,48 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
             if os.path.exists(script_path):
                 os.unlink(script_path)
 
+    def test_scripts_source_put(self):
+        assert (
+            self.fetch("/scripts/source?path=/foo.py", method="PUT", body="x=2").code
+            == 404
+        )
+
+        fd, script_path = tempfile.mkstemp(suffix=".py")
+        os.close(fd)
+        with open(script_path, "w") as f:
+            f.write("x = 1\n")
+
+        loader = self.master.addons.get("scriptloader")
+        s = SimpleNamespace(
+            path=script_path,
+            fullpath=script_path,
+            ns=object(),
+            last_error=None,
+        )
+        loader.addons.append(s)
+        try:
+            resp = self.fetch(
+                "/scripts/source?path=" + urllib.parse.quote(script_path),
+                method="PUT",
+                body='def load(l):\n    pass\n',
+            )
+            assert resp.code == 200
+            assert get_json(resp) == {"path": script_path}
+            with open(script_path) as f:
+                assert f.read() == "def load(l):\n    pass\n"
+
+            # invalid UTF-8 is rejected.
+            resp = self.fetch(
+                "/scripts/source?path=" + urllib.parse.quote(script_path),
+                method="PUT",
+                body=b"\xff\xfe",
+            )
+            assert resp.code == 400
+        finally:
+            loader.addons.remove(s)
+            if os.path.exists(script_path):
+                os.unlink(script_path)
+
     def test_err(self):
         with mock.patch("mitmproxy.tools.web.app.IndexHandler.get") as f:
             f.side_effect = RuntimeError

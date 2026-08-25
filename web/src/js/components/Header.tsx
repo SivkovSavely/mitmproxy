@@ -8,16 +8,23 @@ import { useAppDispatch, useAppSelector } from "../ducks";
 import FlowListMenu from "./Header/FlowListMenu";
 import OptionMenu from "./Header/OptionMenu";
 import FlowMenu from "./Header/FlowMenu";
-import ScriptsMenu from "./Header/ScriptsMenu";
 import type { Menu } from "./ProxyApp";
 import { Tab, setCurrent } from "../ducks/ui/tabs";
 
-const tabs: { [key in Tab]: Menu } = {
+// The Scripts tab owns the whole main view, so it has no header menu.
+const menus: Partial<Record<Tab, Menu>> = {
     [Tab.Capture]: CaptureMenu,
     [Tab.FlowList]: FlowListMenu,
-    [Tab.Scripts]: ScriptsMenu,
     [Tab.Options]: OptionMenu,
     [Tab.Flow]: FlowMenu,
+};
+
+const tabTitles: Record<Tab, string> = {
+    [Tab.Capture]: "Capture",
+    [Tab.FlowList]: "Flow List",
+    [Tab.Scripts]: "Scripts",
+    [Tab.Options]: "Options",
+    [Tab.Flow]: "Flow",
 };
 
 export default function Header() {
@@ -52,7 +59,7 @@ export default function Header() {
         dispatch(setCurrent(tab));
     }
 
-    const ActiveMenu = tabs[currentTab];
+    const ActiveMenu = menus[currentTab];
 
     return (
         <header>
@@ -65,16 +72,14 @@ export default function Header() {
                         className={classnames({ active: tab === currentTab })}
                         onClick={(e) => handleClick(tab, e)}
                     >
-                        {tabs[tab].title}
+                        {tabTitles[tab]}
                     </a>
                 ))}
                 <HideInStatic>
                     <ConnectionIndicator />
                 </HideInStatic>
             </nav>
-            <div>
-                <ActiveMenu />
-            </div>
+            <div>{ActiveMenu ? <ActiveMenu /> : null}</div>
         </header>
     );
 }
