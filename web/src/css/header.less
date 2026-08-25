@@ -110,9 +110,39 @@ header {
 }
 
 .scripts-menu {
+    position: relative;
+
     .menu-content {
         overflow-y: auto;
         min-width: 320px;
+    }
+}
+
+.scripts-detail {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 100;
+    width: min(700px, calc(100vw - 20px));
+    max-height: min(60vh, 500px);
+    overflow-y: auto;
+    padding: 4px;
+    background-color: var(--mitmweb-bg);
+    border: 1px solid var(--mitmweb-border);
+    border-radius: 3px;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 20%);
+
+    .scripts-source-status {
+        color: var(--mitmweb-fg-muted);
+        font-size: 1.2rem;
+        padding: 4px;
+    }
+
+    .codeeditor {
+        .cm-editor {
+            font-size: 1.2rem;
+            max-height: 45vh;
+        }
     }
 }
 

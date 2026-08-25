@@ -61,3 +61,9 @@ test("CodeEditor highlights JSON", async () => {
     );
     expect(asFragment()).toMatchSnapshot();
 });
+test("CodeEditor highlights Python", async () => {
+    const { asFragment } = render(
+        <CodeEditor initialContent="x = 1" readonly language="python" />,
+    );
+    expect(asFragment()).toMatchSnapshot();
+});

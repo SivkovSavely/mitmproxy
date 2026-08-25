@@ -2,6 +2,9 @@ import gzip
 import importlib
 import json
 import logging
+import os
+import tempfile
+import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -453,6 +456,39 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
             "/options", {"scripts": ["/nonexistent/definitely-not-a-script.py"]}
         )
         assert resp.code == 400
+
+    def test_scripts_source(self):
+        assert self.fetch("/scripts/source?path=/foo.py").code == 404
+
+        fd, script_path = tempfile.mkstemp(suffix=".py")
+        os.close(fd)
+        with open(script_path, "w") as f:
+            f.write("x = 1\n")
+
+        loader = self.master.addons.get("scriptloader")
+        s = SimpleNamespace(
+            path=script_path,
+            fullpath=script_path,
+            ns=object(),
+            last_error=None,
+        )
+        loader.addons.append(s)
+        try:
+            resp = self.fetch("/scripts/source?path=" + urllib.parse.quote(script_path))
+            assert resp.code == 200
+            assert get_json(resp) == {
+                "path": script_path,
+                "source": "x = 1\n",
+                "truncated": False,
+            }
+
+            os.unlink(script_path)
+            resp = self.fetch("/scripts/source?path=" + urllib.parse.quote(script_path))
+            assert resp.code == 404
+        finally:
+            loader.addons.remove(s)
+            if os.path.exists(script_path):
+                os.unlink(script_path)
 
     def test_err(self):
         with mock.patch("mitmproxy.tools.web.app.IndexHandler.get") as f:

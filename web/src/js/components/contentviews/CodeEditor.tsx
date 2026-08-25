@@ -5,12 +5,13 @@ import { css } from "@codemirror/lang-css";
 import { html } from "@codemirror/lang-html";
 import { javascript } from "@codemirror/lang-javascript";
 import { json } from "@codemirror/lang-json";
+import { python } from "@codemirror/lang-python";
 import { yaml } from "@codemirror/lang-yaml";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { SyntaxHighlight } from "../../backends/consts";
 import { useResolvedTheme } from "../helpers/useTheme";
 
-type CodeEditorLanguage = SyntaxHighlight | "json";
+type CodeEditorLanguage = SyntaxHighlight | "json" | "python";
 
 type CodeEditorProps = {
     initialContent: string;
@@ -40,6 +41,8 @@ export default function CodeEditor({
                 return [javascript()];
             case "json":
                 return [json()];
+            case "python":
+                return [python()];
             case SyntaxHighlight.CSS:
                 return [css()];
             case undefined:

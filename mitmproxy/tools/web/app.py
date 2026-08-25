@@ -828,6 +828,29 @@ class Scripts(RequestHandler):
         self.write(dict(scripts=self.master.scripts_state()))
 
 
+class ScriptSource(RequestHandler):
+    MAX_SOURCE_SIZE = 2 * 1024 * 1024
+
+    def get(self):
+        path = self.get_query_argument("path")
+        fullpath = os.path.expanduser(path)
+        known = {s["fullpath"] for s in self.master.scripts_state()}
+        if fullpath not in known:
+            raise APIError(404, f"Unknown script: {path}")
+        try:
+            with open(fullpath, encoding="utf-8", errors="replace") as f:
+                source = f.read(self.MAX_SOURCE_SIZE + 1)
+        except OSError:
+            raise APIError(404, f"Cannot read script: {path}")
+        self.write(
+            dict(
+                path=path,
+                source=source[: self.MAX_SOURCE_SIZE],
+                truncated=len(source) > self.MAX_SOURCE_SIZE,
+            )
+        )
+
+
 class State(RequestHandler):
     # Separate method for testability.
     @staticmethod
@@ -913,6 +936,7 @@ handlers = [
     (r"/clear", ClearAll),
     (r"/options(?:\.json)?", Options),
     (r"/options/save", SaveOptions),
+    (r"/scripts/source", ScriptSource),
     (r"/scripts(?:\.json)?", Scripts),
     (r"/state(?:\.json)?", State),
     (r"/processes", ProcessList),

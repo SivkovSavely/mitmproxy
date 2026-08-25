@@ -13,7 +13,6 @@ exports[`ScriptsMenu Component should render script rows and snapshot 1`] = `
       >
         <button
           class="script-name"
-          disabled=""
           title="/tmp/foo.py"
         >
           foo.py

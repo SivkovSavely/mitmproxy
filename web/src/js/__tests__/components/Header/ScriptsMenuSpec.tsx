@@ -6,6 +6,13 @@ import { TStore, testState } from "../../ducks/tutils";
 import { SCRIPTS_RECEIVE } from "../../../ducks/scripts";
 import { ScriptStatusKind } from "../../../ducks/scripts";
 
+// jsdom cannot measure a real CodeMirror instance.
+jest.mock("@uiw/react-codemirror", () => {
+    return function MockCodeMirror({ value }: { value?: string }) {
+        return <div className="mock-codemirror">{value}</div>;
+    };
+});
+
 const scriptsState = {
     list: [
         {
@@ -56,11 +63,18 @@ describe("ScriptsMenu Component", () => {
         expect(asFragment()).toMatchSnapshot();
     });
 
-    it("should toggle error details", async () => {
+    it("should show source and error details", async () => {
+        fetchMock.mockResponseOnce(JSON.stringify({ source: "x = 1\n" }));
         renderMenu();
         expect(screen.queryByText(/SyntaxError/)).toBeNull();
         await act(() => fireEvent.click(screen.getByText("err.py")));
         expect(screen.getByText(/SyntaxError/)).toBeTruthy();
+        const url = String(fetchMock.mock.calls[0]![0]);
+        expect(url).toBe("./scripts/source?path=%2Ftmp%2Ferr.py");
+        expect(await screen.findByText("x = 1")).toBeTruthy();
+        // toggling again hides the detail panel
+        await act(() => fireEvent.click(screen.getByText("err.py")));
+        expect(screen.queryByText(/SyntaxError/)).toBeNull();
     });
 
     it("should add a script via the options API", async () => {

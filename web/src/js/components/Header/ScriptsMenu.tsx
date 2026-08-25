@@ -1,10 +1,12 @@
 import * as React from "react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import classnames from "classnames";
 import Button from "../common/Button";
+import CodeEditor from "../contentviews/CodeEditor";
 import HideInStatic from "../common/HideInStatic";
 import * as optionsActions from "../../ducks/options";
 import type { ScriptStatus } from "../../ducks/scripts";
+import { fetchApi } from "../../utils";
 import { useAppDispatch, useAppSelector } from "../../ducks";
 
 ScriptsMenu.title = "Scripts";
@@ -18,13 +20,36 @@ function ScriptRow({ script }: { script: ScriptStatus }) {
     const dispatch = useAppDispatch();
     const configuredScripts = useAppSelector((state) => state.options.scripts);
     const [expanded, setExpanded] = useState(false);
+    const [source, setSource] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (!expanded || source !== null) {
+            return;
+        }
+        let cancelled = false;
+        fetchApi(`/scripts/source?path=${encodeURIComponent(script.fullpath)}`)
+            .then(async (res) => {
+                if (!res.ok) {
+                    throw new Error(`status ${res.status}`);
+                }
+                return res.json();
+            })
+            .then(
+                (json: { source?: string }) =>
+                    !cancelled && setSource(json.source ?? ""),
+            )
+            .catch(() => !cancelled && setSource(""));
+        return () => {
+            cancelled = true;
+        };
+    }, [expanded, script.fullpath, source]);
+
     return (
         <>
             <div className="scripts-row">
                 <button
                     className="script-name"
                     title={script.fullpath}
-                    disabled={!script.error}
                     onClick={() => setExpanded(!expanded)}
                 >
                     {basename(script.path)}
@@ -54,8 +79,23 @@ function ScriptRow({ script }: { script: ScriptStatus }) {
                     }
                 />
             </div>
-            {expanded && script.error && (
-                <pre className="scripts-error">{script.error}</pre>
+            {expanded && (
+                <div className="scripts-detail">
+                    {script.error && (
+                        <pre className="scripts-error">{script.error}</pre>
+                    )}
+                    {source === null ? (
+                        <div className="scripts-source-status">
+                            Loading source...
+                        </div>
+                    ) : (
+                        <CodeEditor
+                            initialContent={source}
+                            readonly
+                            language="python"
+                        />
+                    )}
+                </div>
             )}
         </>
     );
