@@ -4,6 +4,7 @@ import { createSlice } from "@reduxjs/toolkit";
 export enum Tab {
     Capture,
     FlowList,
+    Scripts,
     Options,
     Flow,
 }

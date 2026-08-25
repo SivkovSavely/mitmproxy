@@ -109,6 +109,102 @@ header {
     padding: 0 5px;
 }
 
+.scripts-menu {
+    .menu-content {
+        overflow-y: auto;
+        min-width: 320px;
+    }
+}
+
+.scripts-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px;
+
+    .script-name {
+        flex: 1;
+        text-align: left;
+        border: none;
+        background: none;
+        padding: 1px 2px;
+        font-size: 1.2rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: inherit;
+
+        &:disabled {
+            cursor: default;
+            opacity: 1;
+        }
+    }
+
+    .scripts-remove.btn-sm {
+        height: 20px;
+        width: 20px;
+        padding: 0;
+        margin: 0;
+        flex-shrink: 0;
+
+        .icon {
+            display: block;
+            margin: 0 auto;
+        }
+    }
+}
+
+.script-status {
+    .connection-label-base();
+    font-size: 10px;
+    flex-shrink: 0;
+
+    &.script-status-loaded {
+        background-color: @label-success-bg;
+    }
+    &.script-status-error {
+        background-color: @label-danger-bg;
+    }
+    &.script-status-loading {
+        background-color: @label-info-bg;
+    }
+}
+
+.scripts-error {
+    margin: 2px 4px;
+    padding: 4px 6px;
+    max-height: 200px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background-color: var(--mitmweb-bg);
+    border: 1px solid var(--mitmweb-border-light);
+    font-size: 1rem;
+}
+
+.scripts-add {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 4px;
+
+    input[type="text"] {
+        flex: 1;
+        min-width: 0;
+        font-size: 1.2rem;
+        padding: 1px 4px;
+        border: 1px solid var(--mitmweb-border);
+        border-radius: 3px;
+    }
+
+    .btn-sm {
+        height: 22px;
+        padding: 0 8px;
+        margin: 0;
+        flex-shrink: 0;
+    }
+}
+
 .menu-group + .menu-group:before {
     @space: 10px;
     margin-left: -(@menu-group-hmargin + 1px);

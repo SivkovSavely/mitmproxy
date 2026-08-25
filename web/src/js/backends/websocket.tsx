@@ -10,6 +10,8 @@ import type { RootState } from "../ducks";
 import { STATE_RECEIVE, STATE_UPDATE } from "../ducks/backendState";
 import { EVENTS_ADD, EVENTS_RECEIVE } from "../ducks/eventLog";
 import { OPTIONS_RECEIVE, OPTIONS_UPDATE } from "../ducks/options";
+import { SCRIPTS_RECEIVE } from "../ducks/scripts";
+import type { ScriptStatus } from "../ducks/scripts";
 import {
     FLOWS_ADD,
     FLOWS_FILTER_UPDATE,
@@ -28,6 +30,7 @@ export enum Resource {
     Flows = "flows",
     Events = "events",
     Options = "options",
+    Scripts = "scripts",
 }
 
 /// All possible events emitted by the WebSocket backend.
@@ -40,7 +43,8 @@ type WebsocketMessageType =
     | "events/add"
     | "events/reset"
     | "options/update"
-    | "state/update";
+    | "state/update"
+    | "scripts/update";
 
 export default class WebsocketBackend {
     activeFetches: Partial<{ [key in Resource]: Array<Action> }>;
@@ -85,6 +89,7 @@ export default class WebsocketBackend {
             this.fetchData(Resource.Flows),
             this.fetchData(Resource.Events),
             this.fetchData(Resource.Options),
+            this.fetchData(Resource.Scripts),
         ]);
         this.store.dispatch(connectionActions.finishFetching());
     }
@@ -120,7 +125,11 @@ export default class WebsocketBackend {
             });
     }
 
-    onMessage(msg: { type: WebsocketMessageType; payload?: any }) {
+    onMessage(msg: {
+        type: WebsocketMessageType;
+        payload?: any;
+        scripts?: ScriptStatus[];
+    }) {
         switch (msg.type) {
             case "flows/add":
                 return this.queueOrDispatch(
@@ -156,6 +165,11 @@ export default class WebsocketBackend {
                 return this.queueOrDispatch(
                     Resource.State,
                     STATE_UPDATE(msg.payload),
+                );
+            case "scripts/update":
+                return this.queueOrDispatch(
+                    Resource.Scripts,
+                    SCRIPTS_RECEIVE(msg.scripts ?? []),
                 );
             case "flows/reset":
                 return this.fetchData(Resource.Flows);
@@ -199,6 +213,9 @@ export default class WebsocketBackend {
                 break;
             case Resource.Flows:
                 this.store.dispatch(FLOWS_RECEIVE(data));
+                break;
+            case Resource.Scripts:
+                this.store.dispatch(SCRIPTS_RECEIVE(data.scripts));
                 break;
             /* istanbul ignore next @preserve */
             default:

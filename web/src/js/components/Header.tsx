@@ -8,12 +8,14 @@ import { useAppDispatch, useAppSelector } from "../ducks";
 import FlowListMenu from "./Header/FlowListMenu";
 import OptionMenu from "./Header/OptionMenu";
 import FlowMenu from "./Header/FlowMenu";
+import ScriptsMenu from "./Header/ScriptsMenu";
 import type { Menu } from "./ProxyApp";
 import { Tab, setCurrent } from "../ducks/ui/tabs";
 
 const tabs: { [key in Tab]: Menu } = {
     [Tab.Capture]: CaptureMenu,
     [Tab.FlowList]: FlowListMenu,
+    [Tab.Scripts]: ScriptsMenu,
     [Tab.Options]: OptionMenu,
     [Tab.Flow]: FlowMenu,
 };
@@ -24,7 +26,7 @@ export default function Header() {
     const selectedFlows = useAppSelector((state) => state.flows.selected);
     const [wasFlowSelected, setWasFlowSelected] = useState(false);
 
-    const entries: Tab[] = [Tab.Capture, Tab.FlowList, Tab.Options];
+    const entries: Tab[] = [Tab.Capture, Tab.FlowList, Tab.Scripts, Tab.Options];
     if (selectedFlows.length > 0) {
         entries.push(Tab.Flow);
     }

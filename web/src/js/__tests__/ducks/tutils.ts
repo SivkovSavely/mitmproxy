@@ -4,6 +4,7 @@ import type { RootState, RootStore } from "../../ducks";
 import { middlewares, reducer } from "../../ducks/store";
 import type { DNSFlow, Flow, HTTPFlow, TCPFlow, UDPFlow } from "../../flow";
 import { defaultState as defaultOptions } from "../../ducks/options";
+import { defaultState as defaultScripts } from "../../ducks/scripts";
 import { TBackendState } from "./_tbackendstate";
 import { configureStore } from "@reduxjs/toolkit";
 import { Tab } from "../../ducks/ui/tabs";
@@ -81,6 +82,7 @@ export const testState: RootState = {
         },
     },
     options: defaultOptions,
+    scripts: defaultScripts,
     flows: {
         selected: [tflow1],
         selectedIds: new Set([tflow1.id]),

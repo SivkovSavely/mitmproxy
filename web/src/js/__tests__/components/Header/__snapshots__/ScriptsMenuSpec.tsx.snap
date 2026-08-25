@@ -1,0 +1,119 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`ScriptsMenu Component should render script rows and snapshot 1`] = `
+<DocumentFragment>
+  <div
+    class="menu-group scripts-menu"
+  >
+    <div
+      class="menu-content"
+    >
+      <div
+        class="scripts-row"
+      >
+        <button
+          class="script-name"
+          disabled=""
+          title="/tmp/foo.py"
+        >
+          foo.py
+        </button>
+        <span
+          class="script-status script-status-loaded"
+        >
+          loaded
+        </span>
+        <button
+          class="btn-sm scripts-remove btn btn-default"
+          title="Remove script"
+        >
+          <svg
+            aria-hidden="true"
+            class="lucide lucide-x icon icon-close text-danger"
+            fill="none"
+            height="16"
+            stroke="currentColor"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            viewBox="0 0 24 24"
+            width="16"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <path
+              d="M18 6 6 18"
+            />
+            <path
+              d="m6 6 12 12"
+            />
+          </svg>
+           
+        </button>
+      </div>
+      <div
+        class="scripts-row"
+      >
+        <button
+          class="script-name"
+          title="/tmp/err.py"
+        >
+          err.py
+        </button>
+        <span
+          class="script-status script-status-error"
+        >
+          error
+        </span>
+        <button
+          class="btn-sm scripts-remove btn btn-default"
+          title="Remove script"
+        >
+          <svg
+            aria-hidden="true"
+            class="lucide lucide-x icon icon-close text-danger"
+            fill="none"
+            height="16"
+            stroke="currentColor"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            viewBox="0 0 24 24"
+            width="16"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <path
+              d="M18 6 6 18"
+            />
+            <path
+              d="m6 6 12 12"
+            />
+          </svg>
+           
+        </button>
+      </div>
+      <div
+        class="scripts-add"
+      >
+        <input
+          placeholder="/absolute/path/to/script.py"
+          title="Path of the Python script to load"
+          type="text"
+          value=""
+        />
+        <button
+          class="btn-sm btn btn-default"
+          disabled=""
+          title="Add script"
+        >
+          Add
+        </button>
+      </div>
+    </div>
+    <div
+      class="menu-legend"
+    >
+      Python Scripts
+    </div>
+  </div>
+</DocumentFragment>
+`;

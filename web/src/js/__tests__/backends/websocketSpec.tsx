@@ -7,6 +7,7 @@ import type { UnknownAction } from "@reduxjs/toolkit";
 import type { EventLogItem } from "../../ducks/eventLog";
 import { EVENTS_ADD, EVENTS_RECEIVE, LogLevel } from "../../ducks/eventLog";
 import { OPTIONS_RECEIVE } from "../../ducks/options";
+import { SCRIPTS_RECEIVE, ScriptStatusKind } from "../../ducks/scripts";
 import { FLOWS_RECEIVE } from "../../ducks/flows";
 import { STATE_RECEIVE } from "../../ducks/backendState";
 import { setFilter } from "../../ducks/ui/filter";
@@ -40,6 +41,7 @@ describe("websocket backend", () => {
         fetchMock.mockOnceIf("./flows", never);
         fetchMock.mockOnceIf("./events", () => events);
         fetchMock.mockOnceIf("./options", never);
+        fetchMock.mockOnceIf("./scripts", never);
 
         const store = TStore(null);
         const backend = new WebSocketBackend(store);
@@ -86,6 +88,7 @@ describe("websocket backend", () => {
         fetchMock.mockOnceIf("./flows", "[]");
         fetchMock.mockOnceIf("./events", "[]");
         fetchMock.mockOnceIf("./options", "{}");
+        fetchMock.mockOnceIf("./scripts", '{"scripts": []}');
 
         const actions: Array<UnknownAction> = [];
         const backend = new WebSocketBackend({
@@ -103,6 +106,7 @@ describe("websocket backend", () => {
             EVENTS_RECEIVE([]),
             // @ts-expect-error mocked
             OPTIONS_RECEIVE({}),
+            SCRIPTS_RECEIVE([]),
             connectionActions.finishFetching(),
         ]);
 
@@ -126,7 +130,7 @@ describe("websocket backend", () => {
         });
         await waitFor(() => expect(actions).toEqual([EVENTS_RECEIVE([])]));
         actions.length = 0;
-        expect(fetchMock.mock.calls).toHaveLength(5);
+        expect(fetchMock.mock.calls).toHaveLength(6);
 
         console.error = jest.fn();
         backend.onClose(new CloseEvent("Connection closed"));
@@ -157,6 +161,17 @@ describe("websocket backend", () => {
         backend.onMessage({ type: "events/reset" });
         backend.onMessage({ type: "options/update" });
         backend.onMessage({ type: "state/update" });
+        backend.onMessage({
+            type: "scripts/update",
+            scripts: [
+                {
+                    path: "foo.py",
+                    fullpath: "/tmp/foo.py",
+                    status: ScriptStatusKind.loaded,
+                    error: null,
+                },
+            ],
+        });
         expect(fetchMock.mock.calls.length).toBe(2);
     });
 

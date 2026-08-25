@@ -46,6 +46,9 @@ export default class StaticBackend {
             case Resource.Events:
                 throw "unreachable";
             /* istanbul ignore next @preserve */
+            case Resource.Scripts:
+                throw "unreachable";
+            /* istanbul ignore next @preserve */
             default:
                 assertNever(resource);
         }
