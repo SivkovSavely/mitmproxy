@@ -32,6 +32,30 @@ def test_load_script(tmp_path, tdata, caplog):
     assert "invalid syntax" in caplog.text
 
 
+def test_load_script_on_error(tmp_path, tdata):
+    errors = []
+    ns = script.load_script(
+        tdata.path("mitmproxy/data/addonscripts/recorder/recorder.py"),
+        errors.append,
+    )
+    assert ns.addons
+    assert not errors
+
+    (tmp_path / "error.py").write_text("this is invalid syntax")
+    script.load_script(str(tmp_path / "error.py"), errors.append)
+    assert len(errors) == 1
+    assert isinstance(errors[0], SyntaxError)
+
+
+def test_format_script_error(tmp_path):
+    (tmp_path / "error.py").write_text("this is invalid syntax")
+    errors = []
+    script.load_script(str(tmp_path / "error.py"), errors.append)
+    formatted = script.format_script_error(errors[0])
+    assert "Traceback" in formatted
+    assert "SyntaxError" in formatted
+
+
 def test_load_fullname(tdata):
     """
     Test that loading two scripts at locations a/foo.py and b/foo.py works.
@@ -135,11 +159,27 @@ class TestScript:
 
     def test_configure_error(self, tdata, caplog):
         with taddons.context():
-            script.Script(
+            sc = script.Script(
                 tdata.path("mitmproxy/data/addonscripts/configure.py"),
                 False,
             )
             assert "Options Error" in caplog.text
+            assert sc.last_error
+            assert "OptionsError" in sc.last_error
+
+    def test_last_error(self, tmp_path, tdata):
+        with taddons.context():
+            f = tmp_path / "broken.py"
+            f.write_text("this is invalid syntax")
+            sc = script.Script(str(f), False)
+            assert sc.last_error
+            assert "SyntaxError" in sc.last_error
+
+            good = script.Script(
+                tdata.path("mitmproxy/data/addonscripts/recorder/recorder.py"),
+                False,
+            )
+            assert good.last_error is None
 
     async def test_addon(self, tdata, caplog_async):
         caplog_async.set_level("INFO")

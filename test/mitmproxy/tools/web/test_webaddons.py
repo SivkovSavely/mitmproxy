@@ -1,8 +1,14 @@
+import asyncio
+from unittest import mock
+
 import pytest
 
+from mitmproxy.addons import script
 from mitmproxy.exceptions import OptionsError
 from mitmproxy.test import taddons
+from mitmproxy.tools.web import app
 from mitmproxy.tools.web import webaddons
+from mitmproxy.utils import asyncio_utils
 
 
 class TestWebAuth:
@@ -77,3 +83,55 @@ class TestWebAuth:
             tctx.options.web_host = web_host
             tctx.options.web_port = web_port
             assert a.web_url.startswith(expected_web_url), a.web_url
+
+
+class TestWebScripts:
+    async def test_watch(self, monkeypatch):
+        monkeypatch.setattr(script, "ReloadInterval", 0)
+        states = [
+            [{"path": "a.py", "status": "loading", "error": None}],
+            # unchanged -> no broadcast
+            [{"path": "a.py", "status": "loading", "error": None}],
+            [{"path": "a.py", "status": "error", "error": "boom"}],
+        ]
+        polls = 0
+
+        def scripts_state():
+            nonlocal polls
+            polls += 1
+            return states[min(polls - 1, len(states) - 1)]
+
+        master = mock.Mock()
+        master.scripts_state.side_effect = scripts_state
+
+        broadcasts = []
+        monkeypatch.setattr(
+            app.ClientConnection,
+            "broadcast",
+            staticmethod(lambda **kwargs: broadcasts.append(kwargs)),
+        )
+
+        w = webaddons.WebScripts()
+        with taddons.context() as tctx:
+            tctx.master.scripts_state = scripts_state
+            task = asyncio_utils.create_task(w.watch(), name="test", keep_ref=False)
+            await asyncio.sleep(0.2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert broadcasts == [
+            {"type": "scripts/update", "scripts": states[0]},
+            {"type": "scripts/update", "scripts": states[2]},
+        ]
+
+    async def test_lifecycle(self, monkeypatch):
+        monkeypatch.setattr(script, "ReloadInterval", 10)
+        w = webaddons.WebScripts()
+        assert w.last_snapshot is None
+        w.running()
+        assert w.watchtask is not None
+        w.done()
+        with pytest.raises(asyncio.CancelledError):
+            await w.watchtask
+        assert w.watchtask.cancelled()

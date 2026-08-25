@@ -4,7 +4,9 @@ import importlib.util
 import logging
 import os
 import sys
+import traceback
 import types
+from collections.abc import Callable
 from collections.abc import Sequence
 
 import mitmproxy.types as mtypes
@@ -20,7 +22,9 @@ from mitmproxy.utils import asyncio_utils
 logger = logging.getLogger(__name__)
 
 
-def load_script(path: str) -> types.ModuleType | None:
+def load_script(
+    path: str, on_error: Callable[[Exception], None] | None = None
+) -> types.ModuleType | None:
     fullname = "__mitmproxy_script__.{}".format(
         os.path.splitext(os.path.basename(path))[0]
     )
@@ -49,9 +53,13 @@ def load_script(path: str) -> types.ModuleType | None:
                 f"(https://docs.mitmproxy.org/stable/overview-installation/#installation-from-the-python-package-index-pypi)."
             )
         script_error_handler(path, e)
+        if on_error:
+            on_error(e)
         return None
     except Exception as e:
         script_error_handler(path, e)
+        if on_error:
+            on_error(e)
         return None
     finally:
         sys.path[:] = oldpath
@@ -71,6 +79,16 @@ def script_error_handler(path: str, exc: Exception) -> None:
     logger.error(f"error in script {path}", exc_info=(type(exc), exc, tback))
 
 
+def format_script_error(exc: Exception) -> str:
+    """
+    Render an exception raised during script loading as a plain traceback string.
+    """
+    tback = exc.__traceback__
+    tback = addonmanager.cut_traceback(tback, "invoke_addon_sync")
+    tback = addonmanager.cut_traceback(tback, "_call_with_frames_removed")
+    return "".join(traceback.format_exception(type(exc), exc, tback)).strip()
+
+
 ReloadInterval = 1
 
 
@@ -85,6 +103,7 @@ class Script:
         self.fullpath = os.path.expanduser(path.strip("'\" "))
         self.ns: types.ModuleType | None = None
         self.is_running = False
+        self.last_error: str | None = None
 
         if not os.path.isfile(self.fullpath):
             raise exceptions.OptionsError(f"No such script: {self.fullpath}")
@@ -112,11 +131,16 @@ class Script:
 
     def loadscript(self):
         logger.info("Loading script %s" % self.path)
+        self.last_error = None
         if self.ns:
             ctx.master.addons.remove(self.ns)
         self.ns = None
+
+        def on_error(e: Exception) -> None:
+            self.last_error = format_script_error(e)
+
         with addonmanager.safecall():
-            ns = load_script(self.fullpath)
+            ns = load_script(self.fullpath, on_error)
             ctx.master.addons.register(ns)
             self.ns = ns
         if self.ns:
@@ -126,6 +150,7 @@ class Script:
                 )
             except Exception as e:
                 script_error_handler(self.fullpath, e)
+                self.last_error = format_script_error(e)
             if self.is_running:
                 # We're already running, so we call that on the addon now.
                 ctx.master.addons.invoke_addon_sync(self.ns, hooks.RunningHook())

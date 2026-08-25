@@ -3,6 +3,7 @@ import importlib
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -421,6 +422,37 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
 
     def test_option_save(self):
         assert self.fetch("/options/save", method="POST").code == 200
+
+    def test_scripts(self):
+        assert get_json(self.fetch("/scripts")) == {"scripts": []}
+
+        loader = self.master.addons.get("scriptloader")
+        s = SimpleNamespace(path="foo.py", fullpath="/foo.py", ns=None, last_error=None)
+        loader.addons.append(s)
+        assert get_json(self.fetch("/scripts")) == {
+            "scripts": [
+                {
+                    "path": "foo.py",
+                    "fullpath": "/foo.py",
+                    "status": "loading",
+                    "error": None,
+                }
+            ]
+        }
+
+        s.ns = object()
+        assert get_json(self.fetch("/scripts"))["scripts"][0]["status"] == "loaded"
+
+        s.last_error = "boom"
+        body = get_json(self.fetch("/scripts"))["scripts"][0]
+        assert body["status"] == "error"
+        assert body["error"] == "boom"
+
+    def test_scripts_invalid_path(self):
+        resp = self.put_json(
+            "/options", {"scripts": ["/nonexistent/definitely-not-a-script.py"]}
+        )
+        assert resp.code == 400
 
     def test_err(self):
         with mock.patch("mitmproxy.tools.web.app.IndexHandler.get") as f:

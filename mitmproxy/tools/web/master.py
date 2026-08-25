@@ -15,6 +15,7 @@ from mitmproxy.addons import errorcheck
 from mitmproxy.addons import eventstore
 from mitmproxy.addons import intercept
 from mitmproxy.addons import readfile
+from mitmproxy.addons import script
 from mitmproxy.addons import view
 from mitmproxy.addons.proxyserver import Proxyserver
 from mitmproxy.tools.web import app
@@ -43,6 +44,7 @@ class WebMaster(master.Master):
         self.addons.add(
             webaddons.WebAddon(),
             webaddons.WebAuth(),
+            webaddons.WebScripts(),
             intercept.Intercept(),
             readfile.ReadFileStdin(),
             static_viewer.StaticViewer(),
@@ -100,6 +102,24 @@ class WebMaster(master.Master):
     @property
     def web_url(self) -> str:
         return cast(webaddons.WebAuth, self.addons.get("webauth")).web_url
+
+    def scripts_state(self) -> list[dict]:
+        """
+        Snapshot of the current state of all configured scripts,
+        as displayed in the web UI's Scripts tab.
+        """
+        loader: script.ScriptLoader = self.addons.get("scriptloader")
+        return [
+            {
+                "path": s.path,
+                "fullpath": s.fullpath,
+                "status": "error"
+                if s.last_error
+                else ("loading" if s.ns is None else "loaded"),
+                "error": s.last_error,
+            }
+            for s in loader.addons
+        ]
 
     async def running(self):
         # Register tornado with the current event loop

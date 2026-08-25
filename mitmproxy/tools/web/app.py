@@ -823,6 +823,11 @@ class SaveOptions(RequestHandler):
         pass
 
 
+class Scripts(RequestHandler):
+    def get(self):
+        self.write(dict(scripts=self.master.scripts_state()))
+
+
 class State(RequestHandler):
     # Separate method for testability.
     @staticmethod
@@ -908,6 +913,7 @@ handlers = [
     (r"/clear", ClearAll),
     (r"/options(?:\.json)?", Options),
     (r"/options/save", SaveOptions),
+    (r"/scripts(?:\.json)?", Scripts),
     (r"/state(?:\.json)?", State),
     (r"/processes", ProcessList),
     (r"/executable-icon", ProcessImage),

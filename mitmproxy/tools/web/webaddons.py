@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import secrets
@@ -11,7 +12,9 @@ import argon2
 
 from mitmproxy import ctx
 from mitmproxy import exceptions
+from mitmproxy.addons import script
 from mitmproxy.tools.web.web_columns import AVAILABLE_WEB_COLUMNS
+from mitmproxy.utils import asyncio_utils
 
 if TYPE_CHECKING:
     from mitmproxy.tools.web.master import WebMaster
@@ -118,6 +121,42 @@ class WebAddon:
                     f"You can configure a fixed authentication token by setting the `web_password` option "
                     f"(https://docs.mitmproxy.org/stable/concepts-options/#web_password).",
                 )
+
+
+class WebScripts:
+    """
+    Periodically broadcasts the state of the configured Python scripts
+    to all connected clients.
+    """
+
+    def __init__(self) -> None:
+        self.last_snapshot: list[dict] | None = None
+        self.watchtask: asyncio.Task | None = None
+
+    def running(self) -> None:
+        # We must not make this an async hook: it would block the sequential
+        # invocation of the running event for all other addons.
+        self.watchtask = asyncio_utils.create_task(
+            self.watch(),
+            name="web scripts watcher",
+            keep_ref=False,
+        )
+
+    def done(self) -> None:
+        if self.watchtask:
+            self.watchtask.cancel()
+
+    async def watch(self) -> None:
+        # Imported here to avoid a circular import: app.py imports webaddons.
+        from mitmproxy.tools.web import app
+
+        while True:
+            await asyncio.sleep(script.ReloadInterval)
+            master: WebMaster = ctx.master  # type: ignore[assignment]
+            state = master.scripts_state()
+            if state != self.last_snapshot:
+                self.last_snapshot = state
+                app.ClientConnection.broadcast(type="scripts/update", scripts=state)
 
 
 def open_browser(url: str) -> bool:
