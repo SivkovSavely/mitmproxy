@@ -836,12 +836,12 @@ class ScriptSource(RequestHandler):
         fullpath = os.path.expanduser(path)
         known = {s["fullpath"] for s in self.master.scripts_state()}
         if fullpath not in known:
-            raise APIError(404, f"Unknown script: {path}")
+            raise APIError(404, "Unknown script")
         try:
             with open(fullpath, encoding="utf-8", errors="replace") as f:
                 source = f.read(self.MAX_SOURCE_SIZE + 1)
         except OSError:
-            raise APIError(404, f"Cannot read script: {path}")
+            raise APIError(404, "Cannot read script")
         self.write(
             dict(
                 path=path,
