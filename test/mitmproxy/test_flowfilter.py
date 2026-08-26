@@ -722,6 +722,27 @@ class TestMatchingHTTPFlow:
         q.server_conn = None
         assert not self.q("~dst address:22", q)
 
+    def test_exact_header_clause_adversarial(self):
+        """The clause the web UI emits for a header row matches exactly.
+
+        Mirrors web/src/js/filt/exactHeader.ts: regex-escape the serialized
+        line, then filter-quote-escape the result. The value deliberately
+        contains regex metacharacters, a quote and a backslash.
+        """
+        value = 'a"b\\c.d(e)[f]'
+        # JS: escapeRegex(value) -> 'a"b\\\\c\\.d\\(e\\)\\[f\\]'
+        # then quoteFilterArgument escapes every backslash and quote.
+        escaped = r"a\"b\\\\c\\.d\\(e\\)\\[f\\]"
+        clause = f'~hqc "^X-W: {escaped}\\r?$"'
+        flt = flowfilter.parse(clause)
+        assert "^X-W: " in str(flt)
+
+        s = tflow.tflow()
+        s.request.headers["X-W"] = value
+        assert bool(flt(s))
+        s.request.headers["X-W"] = value.replace("\\", "")
+        assert not bool(flt(s))
+
     def test_and(self):
         s = self.resp()
         assert self.q("~c 200 & ~h head", s)

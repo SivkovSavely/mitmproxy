@@ -45,6 +45,20 @@ describe("case-sensitive filter variants", () => {
         );
     });
 
+    it("treats &, | and ! inside unquoted operands as literals (backend parity)", () => {
+        expect(Filt.parse("~u a&b").desc).toBe("url matches /a&b/i");
+        expect(Filt.parse("~u a|b").desc).toBe("url matches /a|b/i");
+        expect(Filt.parse("~u /p!q").desc).toBe("url matches /\\/p!q/i");
+    });
+
+    it("keeps &, | and ! structural at operand start, stops at parens", () => {
+        expect(Filt.parse("(~d x) & ~u y").desc).toBe(
+            "(domain matches /x/i) and url matches /y/i",
+        );
+        expect(() => Filt.parse("~u a'b")).toThrow();
+        expect(() => Filt.parse('~u a"b')).toThrow();
+    });
+
     it("combines with boolean operators", () => {
         expect(Filt.parse("~uc foo & ~dc bar").desc).toBe(
             "url matches /foo/ and domain matches /bar/",

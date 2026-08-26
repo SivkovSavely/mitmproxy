@@ -340,7 +340,9 @@ start "filter expression"
   = __ orExpr:OrExpr __ { return orExpr; }
 
 ws "whitespace" = [ \t\n\r]
-cc "control character" = [|&!()~"]
+/* Characters that are structural at the start of an operand. Mirrors the
+   backend's infix_notation operators plus its token delimiters. */
+cc "control character" = [|&!()~']
 __ "optional whitespace" = ws*
 
 OrExpr
@@ -498,7 +500,7 @@ SingleStringChar
   / "\\" char:EscapeSequence { return char; }
 
 UnquotedStringChar
-  = !(ws / cc) char:. { return char; }
+  = !(ws / [()~"']) char:. { return char; }
 
 EscapeSequence
   = ['"\\]
