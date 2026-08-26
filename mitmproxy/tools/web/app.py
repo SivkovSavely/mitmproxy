@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import hashlib
 import json
@@ -9,6 +10,7 @@ import mimetypes
 import os.path
 import re
 import secrets
+import shutil
 import sys
 import tempfile
 import zipfile
@@ -929,10 +931,24 @@ class ScriptSource(RequestHandler):
             source = body.decode("utf-8")
         except UnicodeDecodeError:
             raise APIError(400, "Script must be UTF-8") from None
+        # Write atomically so that the script loader's mtime polling can never
+        # pick up a half-written file.
+        tmp_path: str | None = None
         try:
-            with open(fullpath, "w", encoding="utf-8") as f:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(fullpath) or ".",
+                prefix=".mitmweb-script-",
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(source)
+            with contextlib.suppress(OSError):
+                shutil.copymode(fullpath, tmp_path)
+            os.replace(tmp_path, fullpath)
+            tmp_path = None
         except OSError:
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
             raise APIError(400, "Cannot write script")
         # The script loader picks up the change on its next reload interval.
         self.write(dict(path=path))

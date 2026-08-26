@@ -669,6 +669,14 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
                 body=b"\xff\xfe",
             )
             assert resp.code == 400
+
+            # oversized bodies are rejected.
+            resp = self.fetch(
+                "/scripts/source?path=" + urllib.parse.quote(script_path),
+                method="PUT",
+                body="x" * (app.ScriptSource.MAX_SOURCE_SIZE + 1),
+            )
+            assert resp.code == 400
         finally:
             loader.addons.remove(s)
             if os.path.exists(script_path):
