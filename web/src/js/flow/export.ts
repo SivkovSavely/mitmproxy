@@ -6,6 +6,12 @@ const separators: Partial<Record<string, string>> = {
     raw: "",
     raw_request: "",
     raw_response: "",
+    raw_request_body: "",
+    raw_response_body: "",
+    raw_bodies: "",
+    redacted_request: "",
+    redacted_response: "",
+    redacted: "",
     curl: "\n",
     httpie: "\n",
 };
@@ -19,10 +25,10 @@ export const copy = async (flows: Flow[], format: string): Promise<void> => {
         const exported = await Promise.all(
             flows.map(async (flow) => {
                 const ret = await runCommand("export", format, `@${flow.id}`);
-                if (ret.value) {
-                    return ret.value;
-                } else if (ret.error) {
+                if (ret.error !== undefined) {
                     throw ret.error;
+                } else if (typeof ret.value === "string") {
+                    return ret.value;
                 } else {
                     throw ret;
                 }

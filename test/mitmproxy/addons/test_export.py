@@ -1,3 +1,4 @@
+import gzip
 import os
 import shlex
 from unittest import mock
@@ -294,6 +295,182 @@ class TestRawResponse:
         assert b"content-length: 7" in export.raw_response(request)
 
 
+class TestRawBodies:
+    def test_request_and_response(self, get_flow):
+        get_flow.request.content = b"request body"
+        get_flow.response.content = b"response body"
+        assert export.raw_request_body(get_flow) == b"request body"
+        assert export.raw_response_body(get_flow) == b"response body"
+        assert export.raw_bodies(get_flow) == b"request bodyresponse body"
+
+    def test_one_side_only(self, get_request, get_response):
+        get_request.request.content = b"request body"
+        get_response.request.content = None
+        get_response.response.content = b"response body"
+        assert export.raw_bodies(get_request) == b"request body"
+        assert export.raw_bodies(get_response) == b"response body"
+
+    def test_missing_body(self, get_request, get_response):
+        get_request.request.content = None
+        get_response.response.content = None
+        with pytest.raises(exceptions.CommandError):
+            export.raw_request_body(get_request)
+        with pytest.raises(exceptions.CommandError):
+            export.raw_response_body(get_response)
+        with pytest.raises(exceptions.CommandError):
+            export.raw_bodies(get_request)
+
+    def test_empty_body(self, get_request, get_response):
+        get_request.request.content = b""
+        get_response.response.content = b""
+        assert export.raw_request_body(get_request) == b""
+        assert export.raw_response_body(get_response) == b""
+        assert export.raw_bodies(get_request) == b""
+
+    def test_decodes_content_encoding(self):
+        body = b"decoded body"
+        request = tflow.tflow(req=tutils.treq(content=gzip.compress(body)))
+        request.request.headers["content-encoding"] = "gzip"
+        response = tflow.tflow(resp=tutils.tresp(content=gzip.compress(body)))
+        response.response.headers["content-encoding"] = "gzip"
+
+        assert export.raw_request_body(request) == body
+        assert body in export.raw_request(request)
+        assert export.raw_response_body(response) == body
+        assert body in export.raw_response(response)
+
+    def test_tcp(self, tcp_flow):
+        with pytest.raises(exceptions.CommandError):
+            export.raw_request_body(tcp_flow)
+
+
+class TestRedacted:
+    @pytest.fixture
+    def configured_export(self):
+        e = export.Export()
+        with taddons.context() as tctx:
+            tctx.configure(e)
+            yield e, tctx
+
+    @staticmethod
+    def flow():
+        return tflow.tflow(
+            req=tutils.treq(
+                method=b"POST",
+                content=b"request body",
+                headers=(
+                    (b"Authorization", b"Bearer request"),
+                    (b"X-Test", b"request value"),
+                    (b"authorization", b"another request"),
+                ),
+            ),
+            resp=tutils.tresp(
+                content=b"response body",
+                headers=(
+                    (b"X-Api-Key", b"response key"),
+                    (b"X-Other", b"response value"),
+                ),
+            ),
+        )
+
+    def test_default_redaction(self, configured_export):
+        _, tctx = configured_export
+        f = self.flow()
+        request_fields = f.request.headers.fields
+        response_fields = f.response.headers.fields
+
+        assert b"Authorization: [redacted]" in export.redacted_request(f)
+        assert b"authorization: [redacted]" in export.redacted_request(f)
+        assert b"X-Api-Key: [redacted]" in export.redacted_response(f)
+        assert b"X-Test: request value" in export.redacted_request(f)
+        assert b"request body" in export.redacted_request(f)
+        assert b"response body" in export.redacted_response(f)
+        assert request_fields == f.request.headers.fields
+        assert response_fields == f.response.headers.fields
+        combined = export.redacted(f)
+        assert b"\r\n\r\n" in combined
+        assert b"[redacted]" in combined
+        assert b"Bearer request" not in combined
+        assert tctx.options.redacted_headers
+
+    def test_default_header_patterns(self, configured_export):
+        headers = [
+            "api-key",
+            "api_key",
+            "apikey",
+            "API-Key",
+            "X-Auth-Token",
+            "RefreshToken",
+        ]
+        f = tflow.tflow(
+            req=tutils.treq(
+                headers=tuple((name.encode(), b"secret") for name in headers),
+                content=b"body",
+            )
+        )
+        output = export.redacted_request(f)
+        for name in headers:
+            assert f"{name}: secret".encode() not in output
+            assert f"{name}: [redacted]".encode() in output
+
+    @pytest.mark.parametrize(
+        "header_name, pattern, should_match",
+        [
+            ("X-Foo[0]", "X-Foo[0]", True),
+            ("X-Foo0", "X-Foo[0]", False),
+            ("authorization", "Authorization", False),
+            ("X-Auth-Token-Extra", "/token/", False),
+            ("X-Auth-token-Extra", "/.*token.*/", True),
+            ("Authorization", "/authorization/", False),
+            ("Authorization", "/authorization/i", True),
+            ("/", r"/\//", True),
+        ],
+    )
+    def test_pattern_matching(
+        self, configured_export, header_name, pattern, should_match
+    ):
+        e, tctx = configured_export
+        tctx.configure(e, redacted_headers=[pattern])
+        f = tflow.tflow(
+            req=tutils.treq(
+                headers=((header_name.encode(), b"secret"),), content=b"body"
+            )
+        )
+        assert (b"secret" not in export.redacted_request(f)) is should_match
+
+    def test_replacement_and_whitespace(self, configured_export):
+        _, tctx = configured_export
+        tctx.options.update(
+            redacted_headers=["  Authorization  ", "", "   "],
+            redacted_headers_replacement="",
+        )
+        f = self.flow()
+        output = export.redacted_request(f)
+        assert b"Authorization: \r\n" in output
+        assert b"authorization: another request" in output
+
+    @pytest.mark.parametrize(
+        "pattern",
+        ["/foo", "/foo/z", "/foo/bar/i", "/[/"],
+    )
+    def test_invalid_pattern_is_rejected_during_configure(
+        self, configured_export, pattern
+    ):
+        e, tctx = configured_export
+        tctx.options._options["redacted_headers"].value = [pattern]
+        with pytest.raises(exceptions.OptionsError):
+            e.configure({"redacted_headers"})
+
+    def test_supported_flags(self, configured_export):
+        e, tctx = configured_export
+        tctx.configure(e, redacted_headers=["/foo/ims"])
+
+    def test_binary_export_str(self, configured_export):
+        e, _ = configured_export
+        f = tflow.tflow(req=tutils.treq(content=b"\xff\xfe"))
+        assert e.export_str("raw_request_body", f) == r"\xff\xfe"
+
+
 def qr(f):
     with open(f, "rb") as fp:
         return fp.read()
@@ -305,7 +482,19 @@ def test_export(tmp_path) -> None:
     with taddons.context() as tctx:
         tctx.configure(e)
 
-        assert e.formats() == ["curl", "httpie", "raw", "raw_request", "raw_response"]
+        assert e.formats() == [
+            "curl",
+            "httpie",
+            "raw",
+            "raw_bodies",
+            "raw_request",
+            "raw_request_body",
+            "raw_response",
+            "raw_response_body",
+            "redacted",
+            "redacted_request",
+            "redacted_response",
+        ]
         with pytest.raises(exceptions.CommandError):
             e.file("nonexistent", tflow.tflow(resp=True), f)
 

@@ -1,7 +1,9 @@
 import logging
+import re
 import shlex
 from collections.abc import Callable
 from collections.abc import Sequence
+from functools import cache
 
 import pyperclip
 
@@ -132,6 +134,156 @@ def raw_response(f: flow.Flow) -> bytes:
     return assemble.assemble_response(response)
 
 
+def raw_request_body(f: flow.Flow) -> bytes:
+    request = cleanup_request(f)
+    if request.raw_content is None:
+        raise exceptions.CommandError("Request content missing.")
+    return request.raw_content
+
+
+def raw_response_body(f: flow.Flow) -> bytes:
+    response = cleanup_response(f)
+    if response.raw_content is None:
+        raise exceptions.CommandError("Response content missing.")
+    return response.raw_content
+
+
+def raw_bodies(f: flow.Flow) -> bytes:
+    request_present = (
+        isinstance(f, http.HTTPFlow) and f.request and f.request.raw_content is not None
+    )
+    response_present = (
+        isinstance(f, http.HTTPFlow)
+        and f.response
+        and f.response.raw_content is not None
+    )
+
+    if request_present and response_present:
+        return raw_request_body(f) + raw_response_body(f)
+    elif request_present:
+        return raw_request_body(f)
+    elif response_present:
+        return raw_response_body(f)
+    else:
+        raise exceptions.CommandError("Can't export flow with no request or response.")
+
+
+def parse_redacted_header_pattern(value: str) -> str | re.Pattern[str]:
+    value = value.strip()
+    if not value.startswith("/"):
+        return value
+
+    pattern = []
+    escaped = False
+    closing = None
+    for index, char in enumerate(value[1:], 1):
+        if escaped:
+            pattern.append("/" if char == "/" else "\\" + char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "/":
+            closing = index
+            break
+        else:
+            pattern.append(char)
+
+    if closing is None or escaped:
+        raise ValueError("missing closing delimiter")
+
+    flags = value[closing + 1 :]
+    flag_values = {"i": re.IGNORECASE, "m": re.MULTILINE, "s": re.DOTALL}
+    unknown_flags = set(flags) - flag_values.keys()
+    if unknown_flags:
+        raise ValueError(f"unknown flags: {''.join(sorted(unknown_flags))}")
+
+    try:
+        return re.compile("".join(pattern), sum(flag_values[flag] for flag in flags))
+    except re.error as e:
+        raise ValueError(f"invalid regular expression: {e}") from e
+
+
+@cache
+def _compile_redacted_header_patterns(
+    patterns: tuple[str, ...],
+) -> tuple[str | re.Pattern[str], ...]:
+    return tuple(
+        parse_redacted_header_pattern(pattern)
+        for pattern in patterns
+        if pattern.strip()
+    )
+
+
+def _redacted_header_patterns() -> tuple[str | re.Pattern[str], ...]:
+    return _compile_redacted_header_patterns(tuple(ctx.options.redacted_headers))
+
+
+def _header_matches(name: str, pattern: str | re.Pattern[str]) -> bool:
+    return (
+        pattern.fullmatch(name) is not None
+        if isinstance(pattern, re.Pattern)
+        else name == pattern
+    )
+
+
+def _redact_headers(message: http.Message) -> None:
+    replacement = strutils.always_bytes(
+        ctx.options.redacted_headers_replacement, "utf8", "surrogateescape"
+    )
+    patterns = _redacted_header_patterns()
+    message.headers.fields = tuple(
+        (
+            name,
+            replacement
+            if any(
+                _header_matches(name.decode("utf8", "surrogateescape"), pattern)
+                for pattern in patterns
+            )
+            else value,
+        )
+        for name, value in message.headers.fields
+    )
+
+
+def redacted_request(f: flow.Flow) -> bytes:
+    request = cleanup_request(f)
+    if request.raw_content is None:
+        raise exceptions.CommandError("Request content missing.")
+    _redact_headers(request)
+    return assemble.assemble_request(request)
+
+
+def redacted_response(f: flow.Flow) -> bytes:
+    response = cleanup_response(f)
+    if response.raw_content is None:
+        raise exceptions.CommandError("Response content missing.")
+    _redact_headers(response)
+    return assemble.assemble_response(response)
+
+
+def redacted(f: flow.Flow, separator=b"\r\n\r\n") -> bytes:
+    request_present = (
+        isinstance(f, http.HTTPFlow) and f.request and f.request.raw_content is not None
+    )
+    response_present = (
+        isinstance(f, http.HTTPFlow)
+        and f.response
+        and f.response.raw_content is not None
+    )
+
+    if request_present and response_present:
+        parts = [redacted_request(f), redacted_response(f)]
+        if isinstance(f, http.HTTPFlow) and f.websocket:
+            parts.append(f.websocket._get_formatted_messages())
+        return separator.join(parts)
+    elif request_present:
+        return redacted_request(f)
+    elif response_present:
+        return redacted_response(f)
+    else:
+        raise exceptions.CommandError("Can't export flow with no request or response.")
+
+
 def raw(f: flow.Flow, separator=b"\r\n\r\n") -> bytes:
     """Return either the request or response if only one exists, otherwise return both"""
     request_present = (
@@ -162,6 +314,12 @@ formats: dict[str, Callable[[flow.Flow], str | bytes]] = dict(
     raw=raw,
     raw_request=raw_request,
     raw_response=raw_response,
+    raw_request_body=raw_request_body,
+    raw_response_body=raw_response_body,
+    raw_bodies=raw_bodies,
+    redacted_request=redacted_request,
+    redacted_response=redacted_response,
+    redacted=redacted,
 )
 
 
@@ -179,6 +337,34 @@ class Export:
             curl exports.
             """,
         )
+        loader.add_option(
+            "redacted_headers",
+            Sequence[str],
+            ["/authorization/i", "/.*api[-_]?key.*/i", "/.*token.*/i"],
+            """
+            Header names whose values are redacted in redacted raw exports.
+            Each non-empty line is either a case-sensitive, fully matching
+            literal header name, or a regular expression in /pattern/flags
+            syntax. Regex flags i (ignore case), m (multiline), and s (dotall)
+            are supported. Regex matches are implicitly anchored to the full
+            header name; use .* for substring matching.
+            """,
+        )
+        loader.add_option(
+            "redacted_headers_replacement",
+            str,
+            "[redacted]",
+            "Replacement value for matching header values in redacted raw exports.",
+        )
+
+    def configure(self, updated):
+        if "redacted_headers" in updated:
+            try:
+                _compile_redacted_header_patterns(tuple(ctx.options.redacted_headers))
+            except ValueError as e:
+                raise exceptions.OptionsError(
+                    f"Cannot parse redacted_headers option: {e}"
+                ) from e
 
     @command.command("export.formats")
     def formats(self) -> Sequence[str]:

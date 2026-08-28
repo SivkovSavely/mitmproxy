@@ -50,6 +50,8 @@ export interface OptionsState {
     proxyauth: string | undefined;
     rawtcp: boolean;
     readfile_filter: string | undefined;
+    redacted_headers: string[];
+    redacted_headers_replacement: string;
     request_client_cert: boolean;
     rfile: string | undefined;
     save_stream_file: string | undefined;
@@ -158,6 +160,8 @@ export const defaultState: OptionsState = {
     proxyauth: undefined,
     rawtcp: true,
     readfile_filter: undefined,
+    redacted_headers: ["/authorization/i", "/.*api[-_]?key.*/i", "/.*token.*/i"],
+    redacted_headers_replacement: "[redacted]",
     request_client_cert: false,
     rfile: undefined,
     save_stream_file: undefined,

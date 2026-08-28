@@ -299,6 +299,24 @@ function ExportButton({ flows }: { flows: Flow[] }) {
             <MenuItem onClick={() => copy(flows, "raw")}>
                 Copy raw request and response
             </MenuItem>
+            <MenuItem onClick={() => copy(flows, "raw_request_body")}>
+                Copy raw request body
+            </MenuItem>
+            <MenuItem onClick={() => copy(flows, "raw_response_body")}>
+                Copy raw response body
+            </MenuItem>
+            <MenuItem onClick={() => copy(flows, "raw_bodies")}>
+                Copy raw request and response bodies
+            </MenuItem>
+            <MenuItem onClick={() => copy(flows, "redacted_request")}>
+                Copy redacted request
+            </MenuItem>
+            <MenuItem onClick={() => copy(flows, "redacted_response")}>
+                Copy redacted response
+            </MenuItem>
+            <MenuItem onClick={() => copy(flows, "redacted")}>
+                Copy redacted request and response
+            </MenuItem>
             <MenuItem onClick={() => copy(flows, "curl")}>
                 Copy as cURL
             </MenuItem>

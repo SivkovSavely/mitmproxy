@@ -44,7 +44,17 @@ describe("copy", () => {
         await expect(clipboardPromise()).resolves.toBe("GET /\n");
     });
 
-    it.each(["raw", "raw_request", "raw_response"])(
+    it.each([
+        "raw",
+        "raw_request",
+        "raw_response",
+        "raw_request_body",
+        "raw_response_body",
+        "raw_bodies",
+        "redacted_request",
+        "redacted_response",
+        "redacted",
+    ])(
         "concatenates multiple %s exports exactly, without separators",
         async (format) => {
             mockExports({ "@a": "A\n", "@b": "B\n\n", "@c": "C" });
@@ -67,6 +77,25 @@ describe("copy", () => {
         mockExports({ "@a": "http GET a", "@b": "http GET b" });
         await copy([flowA, flowB], "httpie");
         await expect(clipboardPromise()).resolves.toBe("http GET a\nhttp GET b");
+    });
+
+    it("accepts an empty export result", async () => {
+        mockExports({ "@a": "" });
+        await copy([flowA], "raw_request_body");
+        await expect(clipboardPromise()).resolves.toBe("");
+    });
+
+    it("rejects malformed export results", async () => {
+        const alertMock = jest
+            .spyOn(window, "alert")
+            .mockImplementation(() => {});
+        mockedRunCommand.mockResolvedValue({ value: null });
+
+        await copy([flowA], "raw_request_body");
+
+        await expect(clipboardPromise()).rejects.toEqual({ value: null });
+        expect(alertMock).toHaveBeenCalledWith({ value: null });
+        alertMock.mockRestore();
     });
 
     it("keeps input order when backend calls resolve out of order", async () => {

@@ -75,6 +75,22 @@ describe("Export", () => {
         renderWithSelection([makeHttpFlow("mixed-a"), TTCPFlow()]);
         expect(findButton("Export")).toBeDisabled();
     });
+
+    it("contains body and redacted copy actions", async () => {
+        render(<FlowMenu />);
+        await openDropdown("Export");
+        for (const label of [
+            "Copy raw request body",
+            "Copy raw response body",
+            "Copy raw request and response bodies",
+            "Copy redacted request",
+            "Copy redacted response",
+            "Copy redacted request and response",
+        ]) {
+            expect(menuItem(label)).toBeInTheDocument();
+        }
+        await closeDropdown();
+    });
 });
 
 describe("Download", () => {
