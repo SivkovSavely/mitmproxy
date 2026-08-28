@@ -968,6 +968,16 @@ exports[`FlowView 4`] = `
         <tbody>
           <tr>
             <td>
+              Connection ID:
+            </td>
+            <td>
+              <code>
+                4a18d1a0-50a1-48dd-9aa6-d45d74282939
+              </code>
+            </td>
+          </tr>
+          <tr>
+            <td>
               Address:
             </td>
             <td>
@@ -1025,6 +1035,16 @@ exports[`FlowView 4`] = `
         class="connection-table"
       >
         <tbody>
+          <tr>
+            <td>
+              Connection ID:
+            </td>
+            <td>
+              <code>
+                f087e7b2-6d0a-41a8-a8f0-e1a4761395f8
+              </code>
+            </td>
+          </tr>
           <tr>
             <td>
               Address:

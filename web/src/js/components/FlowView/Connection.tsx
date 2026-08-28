@@ -45,6 +45,12 @@ export function ConnectionInfo({ conn }: ConnectionInfoProps) {
     return (
         <table className="connection-table">
             <tbody>
+                <tr>
+                    <td>Connection ID:</td>
+                    <td>
+                        <code>{conn.id}</code>
+                    </td>
+                </tr>
                 {address_info}
                 {conn.sni ? (
                     <tr>
