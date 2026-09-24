@@ -1,4 +1,5 @@
 import React, { useCallback, useState } from "react";
+import classnames from "classnames";
 import type { HTTPFlow, HTTPMessage } from "../../flow";
 import { useAppDispatch, useAppSelector } from "../../ducks";
 import { setContentViewFor } from "../../ducks/ui/flow";
@@ -14,6 +15,10 @@ import CodeEditor from "./CodeEditor";
 import ContentRenderer from "./ContentRenderer";
 import Icon from "../common/Icon";
 import ViewSelector from "./ViewSelector";
+import {
+    usePersistentBooleanPreference,
+    JSON_WORD_WRAP_STORAGE_KEY,
+} from "../helpers/usePersistentBooleanPreference";
 import { copyViewContentDataToClipboard, fetchApi } from "../../utils";
 
 type HttpMessageProps = {
@@ -106,6 +111,10 @@ function HttpMessageView({ flow, message, startEdit }: HttpMessageViewProps) {
     const contentView = useAppSelector(
         (state) => state.ui.flow.contentViewFor[flow.id + part] || "Auto",
     );
+    const [jsonWordWrap, toggleJsonWordWrap] = usePersistentBooleanPreference(
+        JSON_WORD_WRAP_STORAGE_KEY,
+        false,
+    );
 
     const [maxLines, setMaxLines] = useState<number>(
         useAppSelector((state) => state.options.content_view_lines_cutoff),
@@ -167,16 +176,19 @@ function HttpMessageView({ flow, message, startEdit }: HttpMessageViewProps) {
             `${contentViewData.view_name} ${contentViewData.description}`.trimEnd();
     }
 
+    const isJsonView =
+        contentViewData !== undefined &&
+        (contentViewData.view_name === "JSON" ||
+            contentViewData.view_name === "AI Stream");
     // JSON and AI Stream views are fetched with maxLines + 1 lines unless the
     // JSON document is eligible for eager loading. More lines than maxLines
     // then indicate that the body was cut off.
     const jsonLines =
-        contentViewData &&
-        (contentViewData.view_name === "JSON" ||
-            contentViewData.view_name === "AI Stream")
+        contentViewData && isJsonView
             ? contentViewData.text.split("\n")
             : [];
     const jsonTruncated = !eagerJson && jsonLines.length > maxLines;
+    const usesJsonEditor = jsonLines.length > 0;
 
     return (
         <div className="contentview" key="view">
@@ -184,6 +196,23 @@ function HttpMessageView({ flow, message, startEdit }: HttpMessageViewProps) {
                 <h5>{desc}</h5>
                 {contentViewData && contentViewData?.text.length > 0 && (
                     <CopyButton flow={flow} message={message} />
+                )}
+                {usesJsonEditor && (
+                    <>
+                        &nbsp;
+                        <button
+                            type="button"
+                            className={classnames("btn btn-xs", {
+                                "btn-primary": jsonWordWrap,
+                                "btn-default": !jsonWordWrap,
+                            })}
+                            aria-pressed={jsonWordWrap}
+                            title="Toggle JSON word wrapping"
+                            onClick={toggleJsonWordWrap}
+                        >
+                            Wrap
+                        </button>
+                    </>
                 )}
                 &nbsp;
                 <Button onClick={startEdit} icon="edit" className="btn-xs">
@@ -215,7 +244,7 @@ function HttpMessageView({ flow, message, startEdit }: HttpMessageViewProps) {
             {ViewImage.matches(message) && (
                 <ViewImage flow={flow} message={message} />
             )}
-            {jsonLines.length > 0 ? (
+            {usesJsonEditor ? (
                 <>
                     <CodeEditor
                         initialContent={
@@ -226,6 +255,7 @@ function HttpMessageView({ flow, message, startEdit }: HttpMessageViewProps) {
                         readonly
                         language="json"
                         eagerParse={eagerJson}
+                        lineWrapping={jsonWordWrap}
                     />
                     {jsonTruncated && (
                         <button onClick={showMore} className="btn btn-xs btn-info">

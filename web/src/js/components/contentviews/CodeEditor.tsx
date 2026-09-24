@@ -1,9 +1,6 @@
 import * as React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import CodeMirror, {
-    type EditorView,
-    type ViewUpdate,
-} from "@uiw/react-codemirror";
+import CodeMirror, { type ViewUpdate } from "@uiw/react-codemirror";
 import { forceParsing, language as languageFacet } from "@codemirror/language";
 import { css } from "@codemirror/lang-css";
 import { html } from "@codemirror/lang-html";
@@ -12,6 +9,7 @@ import { json } from "@codemirror/lang-json";
 import { python } from "@codemirror/lang-python";
 import { yaml } from "@codemirror/lang-yaml";
 import { oneDark } from "@codemirror/theme-one-dark";
+import { EditorView } from "@codemirror/view";
 import { SyntaxHighlight } from "../../backends/consts";
 import { useResolvedTheme } from "../helpers/useTheme";
 
@@ -23,6 +21,7 @@ type CodeEditorProps = {
     readonly?: boolean;
     language?: CodeEditorLanguage | null;
     eagerParse?: boolean;
+    lineWrapping?: boolean;
 };
 
 const EAGER_PARSE_SLICE_MS = 100;
@@ -55,6 +54,7 @@ export default function CodeEditor({
     language,
     readonly = false,
     eagerParse = false,
+    lineWrapping = false,
 }: CodeEditorProps) {
     const resolvedTheme = useResolvedTheme();
     const [editorView, setEditorView] = useState<EditorView>();
@@ -127,24 +127,32 @@ export default function CodeEditor({
     }, []);
 
     const extensions = useMemo(() => {
+        let languageExtensions;
         switch (language) {
             case SyntaxHighlight.YAML:
-                return [yaml()];
+                languageExtensions = [yaml()];
+                break;
             case SyntaxHighlight.XML:
-                return [html()];
+                languageExtensions = [html()];
+                break;
             case SyntaxHighlight.JAVASCRIPT:
-                return [javascript()];
+                languageExtensions = [javascript()];
+                break;
             case "json":
-                return [json()];
+                languageExtensions = [json()];
+                break;
             case "python":
-                return [python()];
+                languageExtensions = [python()];
+                break;
             case SyntaxHighlight.CSS:
-                return [css()];
+                languageExtensions = [css()];
+                break;
             case undefined:
             case null:
             case SyntaxHighlight.NONE:
             case SyntaxHighlight.ERROR:
-                return [];
+                languageExtensions = [];
+                break;
             /* istanbul ignore next @preserve */
             default: {
                 const unexpected: never = language;
@@ -152,10 +160,14 @@ export default function CodeEditor({
                     "Unexpected syntax highlighting language: ",
                     unexpected,
                 );
-                return [];
+                languageExtensions = [];
+                break;
             }
         }
-    }, [language]);
+        return lineWrapping
+            ? [...languageExtensions, EditorView.lineWrapping]
+            : languageExtensions;
+    }, [language, lineWrapping]);
     return (
         <div className="codeeditor" onKeyDown={stopPropagation}>
             <CodeMirror

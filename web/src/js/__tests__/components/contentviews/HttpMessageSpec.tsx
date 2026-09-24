@@ -3,6 +3,7 @@ import * as React from "react";
 import HttpMessage, {
     ViewImage,
 } from "../../../components/contentviews/HttpMessage";
+import { JSON_WORD_WRAP_STORAGE_KEY } from "../../../components/helpers/usePersistentBooleanPreference";
 import { act, fireEvent, render, screen, waitFor } from "../../test-utils";
 import { setContentViewFor } from "../../../ducks/ui/flow";
 import fetchMock, { enableFetchMocks } from "jest-fetch-mock";
@@ -15,6 +16,7 @@ type CapturedCodeEditorProps = {
     readonly?: boolean;
     language?: string | null;
     eagerParse?: boolean;
+    lineWrapping?: boolean;
 };
 
 let mockUseCodeEditor = false,
@@ -33,6 +35,7 @@ jest.mock("../../../components/contentviews/CodeEditor", () => {
             readonly,
             language,
             eagerParse,
+            lineWrapping,
         }: CapturedCodeEditorProps) => {
             if (!mockUseCodeEditor) {
                 return actual.default({
@@ -41,6 +44,7 @@ jest.mock("../../../components/contentviews/CodeEditor", () => {
                     readonly,
                     language: language as never,
                     eagerParse,
+                    lineWrapping,
                 });
             }
             mockCapturedOnChange = onChange ?? null;
@@ -50,6 +54,7 @@ jest.mock("../../../components/contentviews/CodeEditor", () => {
                 readonly,
                 language,
                 eagerParse,
+                lineWrapping,
             };
             return (
                 <textarea
@@ -96,6 +101,7 @@ test("HttpMessage", async () => {
     );
     await waitFor(() => screen.getAllByText("data"));
     expect(screen.queryByText("additional")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Wrap" })).toBeNull();
 
     fireEvent.click(screen.getByText("Show more"));
     await waitFor(() => screen.getAllByText("additional"));
@@ -272,13 +278,18 @@ describe("HttpMessage JSON view", () => {
         description: "",
         syntax_highlight: "yaml",
     };
-    const expectJsonEditor = async (content: string, eagerParse = true) => {
+    const expectJsonEditor = async (
+        content: string,
+        eagerParse = true,
+        lineWrapping = false,
+    ) => {
         await waitFor(() =>
             expect(mockCapturedProps).toMatchObject({
                 language: "json",
                 readonly: true,
                 initialContent: content,
                 eagerParse,
+                lineWrapping,
             }),
         );
     };
@@ -287,6 +298,7 @@ describe("HttpMessage JSON view", () => {
         mockUseCodeEditor = true;
         mockCapturedOnChange = null;
         mockCapturedProps = null;
+        window.localStorage.clear();
         fetchMock.resetMocks();
     });
 
@@ -294,6 +306,7 @@ describe("HttpMessage JSON view", () => {
         mockUseCodeEditor = false;
         mockCapturedOnChange = null;
         mockCapturedProps = null;
+        window.localStorage.clear();
     });
 
     test("renders request bodies read-only in json mode", async () => {
@@ -305,6 +318,9 @@ describe("HttpMessage JSON view", () => {
         render(<HttpMessage flow={tflow} message={tflow.request} />);
 
         await expectJsonEditor('{"a": [1, 2]}');
+        const wrap = screen.getByRole("button", { name: "Wrap" });
+        expect(wrap).toHaveAttribute("title", "Toggle JSON word wrapping");
+        expect(wrap).toHaveAttribute("aria-pressed", "false");
         expect(screen.queryByText("Show more")).toBeNull();
     });
 
@@ -336,7 +352,134 @@ describe("HttpMessage JSON view", () => {
             '{"protocol": "openai-chat-completions"}',
             false,
         );
+        fireEvent.click(screen.getByRole("button", { name: "Wrap" }));
+        await expectJsonEditor(
+            '{"protocol": "openai-chat-completions"}',
+            false,
+            true,
+        );
         expect(screen.queryByText("Show more")).toBeNull();
+    });
+
+    test("toggles and persists JSON wrapping immediately", async () => {
+        fetchMock.mockResponse(
+            JSON.stringify({ text: '{"wrapped": true}', ...cvdJson }),
+        );
+
+        const tflow = TFlow();
+        render(<HttpMessage flow={tflow} message={tflow.request} />);
+        await expectJsonEditor('{"wrapped": true}');
+
+        const wrap = screen.getByRole("button", { name: "Wrap" });
+        fireEvent.click(wrap);
+        await expectJsonEditor('{"wrapped": true}', true, true);
+        expect(wrap).toHaveAttribute("aria-pressed", "true");
+        expect(window.localStorage.getItem(JSON_WORD_WRAP_STORAGE_KEY)).toBe(
+            "true",
+        );
+
+        fireEvent.click(wrap);
+        await expectJsonEditor('{"wrapped": true}', true, false);
+        expect(wrap).toHaveAttribute("aria-pressed", "false");
+        expect(window.localStorage.getItem(JSON_WORD_WRAP_STORAGE_KEY)).toBe(
+            "false",
+        );
+    });
+
+    test("remounting a JSON viewer restores the persisted preference", async () => {
+        fetchMock.mockResponse(
+            JSON.stringify({ text: '{"request": true}', ...cvdJson }),
+        );
+
+        const tflow = TFlow();
+        const first = render(
+            <HttpMessage flow={tflow} message={tflow.request} />,
+        );
+        await expectJsonEditor('{"request": true}');
+        fireEvent.click(screen.getByRole("button", { name: "Wrap" }));
+        await expectJsonEditor('{"request": true}', true, true);
+        first.unmount();
+
+        render(<HttpMessage flow={tflow} message={tflow.request} />);
+        await waitFor(() =>
+            screen.getByRole("button", { name: "Wrap" }),
+        );
+        await expectJsonEditor('{"request": true}', true, true);
+        expect(screen.getByRole("button", { name: "Wrap" })).toHaveAttribute(
+            "aria-pressed",
+            "true",
+        );
+    });
+
+    test("request and response viewers share the wrapping preference", async () => {
+        fetchMock.mockResponse(
+            JSON.stringify({ text: '{"body": true}', ...cvdJson }),
+        );
+
+        const tflow = TFlow();
+        const view = render(
+            <HttpMessage flow={tflow} message={tflow.request} />,
+        );
+        await expectJsonEditor('{"body": true}');
+        fireEvent.click(screen.getByRole("button", { name: "Wrap" }));
+        await expectJsonEditor('{"body": true}', true, true);
+
+        view.rerender(<HttpMessage flow={tflow} message={tflow.response} />);
+        await expectJsonEditor('{"body": true}', true, true);
+    });
+
+    test("switching away from JSON and back restores wrapping", async () => {
+        fetchMock.mockResponses(
+            JSON.stringify({
+                text: "not json",
+                view_name: "Raw",
+                description: "",
+                syntax_highlight: "none",
+            }),
+            JSON.stringify({ text: '{"json": true}', ...cvdJson }),
+            JSON.stringify({
+                text: "not json again",
+                view_name: "Raw",
+                description: "",
+                syntax_highlight: "none",
+            }),
+            JSON.stringify({ text: '{"json": true}', ...cvdJson }),
+        );
+        const tflow = TFlow();
+        const state = {
+            ...testState,
+            backendState: {
+                ...testState.backendState,
+                contentViews: [...testState.backendState.contentViews, "JSON"],
+            },
+            ui: {
+                ...testState.ui,
+                flow: {
+                    ...testState.ui.flow,
+                    contentViewFor: { [tflow.id + "request"]: "Raw" },
+                },
+            },
+        };
+        render(<HttpMessage flow={tflow} message={tflow.request} />, {
+            store: TStore(state),
+        });
+        await waitFor(() => screen.getByText("not json"));
+        expect(screen.queryByRole("button", { name: "Wrap" })).toBeNull();
+
+        fireEvent.click(screen.getByText("raw"));
+        fireEvent.click(screen.getByText("json"));
+        await expectJsonEditor('{"json": true}');
+        fireEvent.click(screen.getByRole("button", { name: "Wrap" }));
+        await expectJsonEditor('{"json": true}', true, true);
+
+        fireEvent.click(screen.getByText("json"));
+        fireEvent.click(screen.getByText("raw"));
+        await waitFor(() => screen.getByText("not json again"));
+        expect(screen.queryByRole("button", { name: "Wrap" })).toBeNull();
+
+        fireEvent.click(screen.getByText("raw"));
+        fireEvent.click(screen.getByText("json"));
+        await expectJsonEditor('{"json": true}', true, true);
     });
 
     test("switching Auto -> JSON uses the json viewer despite the yaml hint", async () => {
@@ -394,6 +537,8 @@ describe("HttpMessage JSON view", () => {
         });
 
         await expectJsonEditor(text);
+        fireEvent.click(screen.getByRole("button", { name: "Wrap" }));
+        await expectJsonEditor(text, true, true);
         expect(screen.queryByText("Show more")).toBeNull();
         const contentUrls = fetchMock.mock.calls
             .map(([url]) => String(url))
@@ -425,6 +570,8 @@ describe("HttpMessage JSON view", () => {
         });
 
         await expectJsonEditor(expect.any(String), false);
+        fireEvent.click(screen.getByRole("button", { name: "Wrap" }));
+        await expectJsonEditor(expect.any(String), false, true);
         expect(screen.getByText("Show more")).toBeTruthy();
         const contentUrls = fetchMock.mock.calls
             .map(([url]) => String(url))
@@ -576,6 +723,8 @@ describe("HttpMessage JSON view", () => {
         render(<HttpMessage flow={tflow} message={tflow.request} />);
 
         await expectJsonEditor(expect.any(String), false);
+        fireEvent.click(screen.getByRole("button", { name: "Wrap" }));
+        await expectJsonEditor(expect.any(String), false, true);
         const editor = screen.getByTestId("mock-editor") as HTMLTextAreaElement;
         expect(editor.defaultValue.split("\n")).toHaveLength(512);
         expect(editor.defaultValue).not.toContain('"last"');
@@ -594,6 +743,7 @@ describe("HttpMessage JSON view", () => {
                 "mock-editor",
             ) as HTMLTextAreaElement;
             expect(grown.defaultValue).toContain('"last"');
+            expect(mockCapturedProps?.lineWrapping).toBe(true);
         });
         expect(screen.queryByText("Show more")).toBeNull();
 
