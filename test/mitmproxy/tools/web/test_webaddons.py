@@ -66,6 +66,19 @@ class TestWebAuth:
             tctx.options.web_theme = "dark"
             assert tctx.options.web_theme == "dark"
 
+    def test_web_json_eager_parse_max_bytes_option(self):
+        with taddons.context(webaddons.WebAddon()) as tctx:
+            option = tctx.options._options["web_json_eager_parse_max_bytes"]
+            assert option.default == 2097152
+            assert "contentLength" in option.help
+            assert "pretty-printed JSON text may be larger" in option.help
+
+            tctx.options.web_json_eager_parse_max_bytes = 0
+            assert tctx.options.web_json_eager_parse_max_bytes == 0
+            with pytest.raises(OptionsError):
+                tctx.options.web_json_eager_parse_max_bytes = -1
+            assert tctx.options.web_json_eager_parse_max_bytes == 0
+
     @pytest.mark.parametrize(
         "web_host,web_port,expected_web_url",
         [

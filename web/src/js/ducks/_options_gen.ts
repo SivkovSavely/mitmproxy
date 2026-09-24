@@ -99,6 +99,7 @@ export interface OptionsState {
     web_columns: string[];
     web_debug: boolean;
     web_host: string;
+    web_json_eager_parse_max_bytes: number;
     web_open_browser: boolean;
     web_password: string;
     web_port: number;
@@ -209,6 +210,7 @@ export const defaultState: OptionsState = {
     web_columns: ["tls", "icon", "path", "method", "status", "size", "time"],
     web_debug: false,
     web_host: "127.0.0.1",
+    web_json_eager_parse_max_bytes: 2097152,
     web_open_browser: true,
     web_password: "",
     web_port: 8081,

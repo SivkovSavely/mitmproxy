@@ -115,13 +115,47 @@ function HttpMessageView({ flow, message, startEdit }: HttpMessageViewProps) {
         [maxLines],
     );
 
-    const contentViewData = useContentView(
+    const eagerParseMaxBytes = useAppSelector(
+        (state) => state.options.web_json_eager_parse_max_bytes,
+    );
+    const eagerSizeEligible =
+        eagerParseMaxBytes > 0 &&
+        typeof message.contentLength === "number" &&
+        message.contentLength <= eagerParseMaxBytes;
+    const isAutoView = contentView.toLowerCase() === "auto";
+    const explicitEagerJson =
+        contentView.toLowerCase() === "json" && eagerSizeEligible;
+
+    const boundedContentViewData = useContentView(
         flow,
         message,
         contentView,
-        maxLines + 1,
+        explicitEagerJson ? undefined : maxLines + 1,
         message.contentHash,
     );
+    const autoEagerJson =
+        isAutoView &&
+        boundedContentViewData?.view_name === "JSON" &&
+        eagerSizeEligible;
+    const fullContentViewData = useContentView(
+        flow,
+        message,
+        contentView,
+        undefined,
+        message.contentHash,
+        autoEagerJson,
+    );
+    const contentViewData = autoEagerJson
+        ? fullContentViewData?.view_name === "JSON"
+            ? fullContentViewData
+            : fullContentViewData
+              ? boundedContentViewData
+              : undefined
+        : boundedContentViewData;
+    const eagerJson =
+        contentViewData?.view_name === "JSON" &&
+        (explicitEagerJson ||
+            (autoEagerJson && fullContentViewData?.view_name === "JSON"));
 
     let desc: string;
     if (message.contentLength === 0) {
@@ -133,15 +167,16 @@ function HttpMessageView({ flow, message, startEdit }: HttpMessageViewProps) {
             `${contentViewData.view_name} ${contentViewData.description}`.trimEnd();
     }
 
-    // The JSON and AI Stream views are fetched with maxLines + 1 lines, so more
-    // lines than that indicate the body was cut off.
+    // JSON and AI Stream views are fetched with maxLines + 1 lines unless the
+    // JSON document is eligible for eager loading. More lines than maxLines
+    // then indicate that the body was cut off.
     const jsonLines =
         contentViewData &&
         (contentViewData.view_name === "JSON" ||
             contentViewData.view_name === "AI Stream")
             ? contentViewData.text.split("\n")
             : [];
-    const jsonTruncated = jsonLines.length > maxLines;
+    const jsonTruncated = !eagerJson && jsonLines.length > maxLines;
 
     return (
         <div className="contentview" key="view">
@@ -190,6 +225,7 @@ function HttpMessageView({ flow, message, startEdit }: HttpMessageViewProps) {
                         }
                         readonly
                         language="json"
+                        eagerParse={eagerJson}
                     />
                     {jsonTruncated && (
                         <button onClick={showMore} className="btn btn-xs btn-info">

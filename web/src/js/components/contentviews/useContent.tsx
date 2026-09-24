@@ -1,13 +1,22 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { fetchApi } from "../../utils";
 
-export function useContent(url: string, hash?: string): string | undefined {
-    const [content, setContent] = useState<string>();
-    const [abort, setAbort] = useState<AbortController>();
+type ContentState = {
+    key: object;
+    text: string;
+};
+
+export function useContent(
+    url: string,
+    hash?: string,
+    enabled = true,
+): string | undefined {
+    const requestKey = useMemo(() => ({}), [enabled, url, hash]);
+    const [content, setContent] = useState<ContentState>();
 
     useEffect(() => {
-        if (abort) {
-            abort.abort();
+        if (!enabled) {
+            return;
         }
 
         const controller = new AbortController();
@@ -18,20 +27,27 @@ export function useContent(url: string, hash?: string): string | undefined {
                 return response.text();
             })
             .then((text) => {
-                setContent(text);
+                if (!controller.signal.aborted) {
+                    setContent({ key: requestKey, text });
+                }
             })
             .catch((e) => {
                 if (controller.signal.aborted) {
                     return;
                 }
-                setContent(`Error getting content: ${e}.`);
+                setContent({
+                    key: requestKey,
+                    text: `Error getting content: ${e}.`,
+                });
             });
 
-        setAbort(controller);
         return () => {
             if (!controller.signal.aborted) controller.abort();
         };
-    }, [url, hash]);
+    }, [enabled, requestKey, url]);
 
-    return content;
+    if (!enabled || content?.key !== requestKey) {
+        return undefined;
+    }
+    return content.text;
 }

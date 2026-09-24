@@ -4,6 +4,7 @@ import HttpMessage, {
     ViewImage,
 } from "../../../components/contentviews/HttpMessage";
 import { act, fireEvent, render, screen, waitFor } from "../../test-utils";
+import { setContentViewFor } from "../../../ducks/ui/flow";
 import fetchMock, { enableFetchMocks } from "jest-fetch-mock";
 
 enableFetchMocks();
@@ -13,6 +14,7 @@ type CapturedCodeEditorProps = {
     onChange?: (content: string) => void;
     readonly?: boolean;
     language?: string | null;
+    eagerParse?: boolean;
 };
 
 let mockUseCodeEditor = false,
@@ -30,6 +32,7 @@ jest.mock("../../../components/contentviews/CodeEditor", () => {
             onChange,
             readonly,
             language,
+            eagerParse,
         }: CapturedCodeEditorProps) => {
             if (!mockUseCodeEditor) {
                 return actual.default({
@@ -37,6 +40,7 @@ jest.mock("../../../components/contentviews/CodeEditor", () => {
                     onChange,
                     readonly,
                     language: language as never,
+                    eagerParse,
                 });
             }
             mockCapturedOnChange = onChange ?? null;
@@ -45,6 +49,7 @@ jest.mock("../../../components/contentviews/CodeEditor", () => {
                 onChange,
                 readonly,
                 language,
+                eagerParse,
             };
             return (
                 <textarea
@@ -267,12 +272,13 @@ describe("HttpMessage JSON view", () => {
         description: "",
         syntax_highlight: "yaml",
     };
-    const expectJsonEditor = async (content: string) => {
+    const expectJsonEditor = async (content: string, eagerParse = true) => {
         await waitFor(() =>
             expect(mockCapturedProps).toMatchObject({
                 language: "json",
                 readonly: true,
                 initialContent: content,
+                eagerParse,
             }),
         );
     };
@@ -326,7 +332,10 @@ describe("HttpMessage JSON view", () => {
         const tflow = TFlow();
         render(<HttpMessage flow={tflow} message={tflow.response} />);
 
-        await expectJsonEditor('{"protocol": "openai-chat-completions"}');
+        await expectJsonEditor(
+            '{"protocol": "openai-chat-completions"}',
+            false,
+        );
         expect(screen.queryByText("Show more")).toBeNull();
     });
 
@@ -361,6 +370,199 @@ describe("HttpMessage JSON view", () => {
         await expectJsonEditor('{"d": 4}');
     });
 
+    test("eager JSON fetches the complete document without a line limit", async () => {
+        const text = "{\n" + '"line",\n'.repeat(600) + '"last"\n}';
+        fetchMock.mockResponse(JSON.stringify({ text, ...cvdJson }));
+        const tflow = TFlow();
+        const state = {
+            ...testState,
+            backendState: {
+                ...testState.backendState,
+                contentViews: [...testState.backendState.contentViews, "JSON"],
+            },
+            ui: {
+                ...testState.ui,
+                flow: {
+                    ...testState.ui.flow,
+                    contentViewFor: { [tflow.id + "request"]: "JSON" },
+                },
+            },
+        };
+
+        render(<HttpMessage flow={tflow} message={tflow.request} />, {
+            store: TStore(state),
+        });
+
+        await expectJsonEditor(text);
+        expect(screen.queryByText("Show more")).toBeNull();
+        const contentUrls = fetchMock.mock.calls
+            .map(([url]) => String(url))
+            .filter((url) => url.includes("/content/"));
+        expect(contentUrls).toHaveLength(1);
+        expect(contentUrls[0]).not.toContain("?lines=");
+    });
+
+    test("threshold 0 keeps the JSON cutoff behavior", async () => {
+        const text = "{\n" + '"line",\n'.repeat(600) + '"last"\n}';
+        fetchMock.mockResponses(
+            JSON.stringify({
+                text: "{\n" + '"line",\n'.repeat(600),
+                ...cvdJson,
+            }),
+            JSON.stringify({ text, ...cvdJson }),
+        );
+        const tflow = TFlow();
+        const state = {
+            ...testState,
+            options: {
+                ...testState.options,
+                web_json_eager_parse_max_bytes: 0,
+            },
+        };
+
+        render(<HttpMessage flow={tflow} message={tflow.request} />, {
+            store: TStore(state),
+        });
+
+        await expectJsonEditor(expect.any(String), false);
+        expect(screen.getByText("Show more")).toBeTruthy();
+        const contentUrls = fetchMock.mock.calls
+            .map(([url]) => String(url))
+            .filter((url) => url.includes("/content/"));
+        expect(contentUrls[0]).toContain("?lines=513");
+    });
+
+    test("non-JSON content below the threshold keeps the line cutoff", async () => {
+        const text = "data\n".repeat(600);
+        fetchMock.mockResponse(
+            JSON.stringify({
+                text,
+                view_name: "Raw",
+                description: "",
+                syntax_highlight: "none",
+            }),
+        );
+        const tflow = TFlow();
+
+        render(<HttpMessage flow={tflow} message={tflow.request} />);
+
+        await waitFor(() =>
+            expect(screen.getAllByText("data")[0]).toBeTruthy(),
+        );
+        expect(screen.queryByTestId("mock-editor")).toBeNull();
+        expect(screen.getByText("Show more")).toBeTruthy();
+        const contentUrls = fetchMock.mock.calls
+            .map(([url]) => String(url))
+            .filter((url) => url.includes("/content/"));
+        expect(contentUrls[0]).toContain("?lines=513");
+    });
+
+    test("Auto JSON is refetched without a line limit", async () => {
+        const bounded = "{\n" + '"line",\n'.repeat(20);
+        const full = bounded + '"last"\n}';
+        fetchMock.mockResponses(
+            JSON.stringify({ text: bounded, ...cvdJson }),
+            JSON.stringify({ text: full, ...cvdJson }),
+        );
+        const tflow = TFlow();
+        const state = {
+            ...testState,
+            ui: {
+                ...testState.ui,
+                flow: {
+                    ...testState.ui.flow,
+                    contentViewFor: { [tflow.id + "request"]: "auto" },
+                },
+            },
+        };
+
+        render(<HttpMessage flow={tflow} message={tflow.request} />, {
+            store: TStore(state),
+        });
+
+        await expectJsonEditor(full);
+        expect(screen.queryByText("Show more")).toBeNull();
+        const contentUrls = fetchMock.mock.calls
+            .map(([url]) => String(url))
+            .filter((url) => url.includes("/content/"));
+        expect(contentUrls).toHaveLength(2);
+        expect(contentUrls[0]).toContain("?lines=513");
+        expect(contentUrls[1]).not.toContain("?lines=");
+    });
+
+    test("does not reuse eager content across flows or content views", async () => {
+        const flow1 = TFlow();
+        const flow2 = TFlow();
+        flow2.id = "second-flow";
+        const json1 = '{"flow": 1}';
+        const json2 = '{"flow": 2}';
+        const raw = "raw second flow";
+        fetchMock.mockResponses(
+            JSON.stringify({ text: json1, ...cvdJson }),
+            JSON.stringify({ text: json1, ...cvdJson }),
+            JSON.stringify({ text: json2, ...cvdJson }),
+            JSON.stringify({ text: json2, ...cvdJson }),
+            JSON.stringify({
+                text: raw,
+                view_name: "Raw",
+                description: "",
+                syntax_highlight: "none",
+            }),
+        );
+        const store = TStore();
+        const { rerender } = render(
+            <HttpMessage flow={flow1} message={flow1.request} />,
+            { store },
+        );
+
+        await expectJsonEditor(json1);
+        rerender(<HttpMessage flow={flow2} message={flow2.request} />);
+        await expectJsonEditor(json2);
+        expect(mockCapturedProps?.initialContent).not.toBe(json1);
+
+        act(() => {
+            store.dispatch(
+                setContentViewFor({
+                    messageId: flow2.id + "request",
+                    contentView: "Raw",
+                }),
+            );
+        });
+        await waitFor(() => expect(screen.getByText(raw)).toBeTruthy());
+        expect(screen.queryByTestId("mock-editor")).toBeNull();
+        expect(screen.queryByText(json2)).toBeNull();
+    });
+
+    test("does not reuse eager content after the body hash changes", async () => {
+        const flow = TFlow();
+        const first = '{"hash": 1}';
+        const second = '{"hash": 2}';
+        fetchMock.mockResponses(
+            JSON.stringify({ text: first, ...cvdJson }),
+            JSON.stringify({ text: second, ...cvdJson }),
+        );
+        const state = {
+            ...testState,
+            ui: {
+                ...testState.ui,
+                flow: {
+                    ...testState.ui.flow,
+                    contentViewFor: { [flow.id + "request"]: "JSON" },
+                },
+            },
+        };
+        const { rerender } = render(
+            <HttpMessage flow={flow} message={flow.request} />,
+            { store: TStore(state) },
+        );
+
+        await expectJsonEditor(first);
+        flow.request.contentHash = "new-content-hash";
+        rerender(<HttpMessage flow={flow} message={flow.request} />);
+        await expectJsonEditor(second);
+        expect(mockCapturedProps?.initialContent).not.toBe(first);
+    });
+
     test("truncated json shows maxLines lines plus Show more", async () => {
         const fullJson = '{\n' + '"line",\n'.repeat(512) + '"last"\n}';
         const truncatedJson = '{\n' + '"line",\n'.repeat(512);
@@ -370,9 +572,10 @@ describe("HttpMessage JSON view", () => {
         );
 
         const tflow = TFlow();
+        tflow.request.contentLength = 2097153;
         render(<HttpMessage flow={tflow} message={tflow.request} />);
 
-        await expectJsonEditor(expect.any(String));
+        await expectJsonEditor(expect.any(String), false);
         const editor = screen.getByTestId("mock-editor") as HTMLTextAreaElement;
         expect(editor.defaultValue.split("\n")).toHaveLength(512);
         expect(editor.defaultValue).not.toContain('"last"');

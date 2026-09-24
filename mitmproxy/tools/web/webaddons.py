@@ -93,6 +93,14 @@ class WebAddon:
         loader.add_option("web_open_browser", bool, True, "Start a browser.")
         loader.add_option("web_debug", bool, False, "Enable mitmweb debugging.")
         loader.add_option("web_port", int, 8081, "Web UI port.")
+        loader.add_option(
+            "web_json_eager_parse_max_bytes",
+            int,
+            2097152,
+            "Maximum stored/raw HTTP body size in bytes for which mitmweb eagerly loads and parses JSON content views. "
+            "Set to 0 to disable eager JSON loading. The limit is based on the HTTP message's stored/raw body size exposed as contentLength; "
+            "the pretty-printed JSON text may be larger.",
+        )
         loader.add_option("web_host", str, "127.0.0.1", "Web UI host.")
         loader.add_option(
             "web_columns",
@@ -107,6 +115,15 @@ class WebAddon:
             "Preferred color theme for the mitmweb user interface.",
             choices=["system", "dark", "light"],
         )
+
+    def configure(self, updated) -> None:
+        if (
+            "web_json_eager_parse_max_bytes" in updated
+            and ctx.options.web_json_eager_parse_max_bytes < 0
+        ):
+            raise exceptions.OptionsError(
+                "web_json_eager_parse_max_bytes must be zero or greater."
+            )
 
     def running(self):
         if hasattr(ctx.options, "web_open_browser") and ctx.options.web_open_browser:

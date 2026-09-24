@@ -18,6 +18,7 @@ export function useContentView(
     view?: string,
     lines?: number,
     hash?: string,
+    enabled?: boolean,
 ): ContentViewData[] | undefined;
 
 export function useContentView(
@@ -26,6 +27,7 @@ export function useContentView(
     view?: string,
     lines?: number,
     hash?: string,
+    enabled?: boolean,
 ): ContentViewData | undefined;
 
 export function useContentView(
@@ -34,9 +36,10 @@ export function useContentView(
     view?: string,
     lines?: number,
     hash?: string,
+    enabled = true,
 ): ContentViewData | ContentViewData[] | undefined {
     const url = MessageUtils.getContentURL(flow, part, view, lines);
-    const cv_json = useContent(url, hash);
+    const cv_json = useContent(url, hash, enabled);
     return useMemo<ContentViewData | undefined>(() => {
         if (cv_json) {
             try {
@@ -57,5 +60,5 @@ export function useContentView(
         } else {
             return undefined;
         }
-    }, [cv_json]);
+    }, [cv_json, enabled, hash, url]);
 }
