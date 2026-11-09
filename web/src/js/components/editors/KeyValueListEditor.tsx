@@ -17,6 +17,7 @@ type RowProps = {
 
 class Row extends Component<RowProps> {
     container = React.createRef<HTMLDivElement>();
+    content = React.createRef<HTMLDivElement>();
     nameInput = React.createRef<ValueEditor>();
     valueInput = React.createRef<ValueEditor>();
 
@@ -30,28 +31,30 @@ class Row extends Component<RowProps> {
                 onClick={this.onClick}
                 onKeyDownCapture={this.onKeyDown}
             >
-                <ValueEditor
-                    ref={this.nameInput}
-                    className="kv-key"
-                    content={key}
-                    onEditStart={this.props.onEditStart}
-                    onEditDone={(newKey) =>
-                        this.props.onEditDone([newKey, value])
-                    }
-                    selectAllOnClick={true}
-                />
-                :&nbsp;
-                <ValueEditor
-                    ref={this.valueInput}
-                    className="kv-value"
-                    content={value}
-                    onEditStart={this.props.onEditStart}
-                    onEditDone={(newVal) =>
-                        this.props.onEditDone([key, newVal])
-                    }
-                    placeholder="empty"
-                    selectAllOnClick={true}
-                />
+                <div className="kv-row-content" ref={this.content}>
+                    <ValueEditor
+                        ref={this.nameInput}
+                        className="kv-key"
+                        content={key}
+                        onEditStart={this.props.onEditStart}
+                        onEditDone={(newKey) =>
+                            this.props.onEditDone([newKey, value])
+                        }
+                        selectAllOnClick={true}
+                    />
+                    :&nbsp;
+                    <ValueEditor
+                        ref={this.valueInput}
+                        className="kv-value"
+                        content={value}
+                        onEditStart={this.props.onEditStart}
+                        onEditDone={(newVal) =>
+                            this.props.onEditDone([key, newVal])
+                        }
+                        placeholder="empty"
+                        selectAllOnClick={true}
+                    />
+                </div>
                 {this.props.rowAction && (
                     // The action is fully isolated from the editing behavior
                     // of the surrounding row.
@@ -69,7 +72,11 @@ class Row extends Component<RowProps> {
     };
 
     onClick = (e: React.MouseEvent) => {
-        if (e.target === this.container.current) this.props.onClickEmptyArea();
+        if (
+            e.target === this.container.current ||
+            e.target === this.content.current
+        )
+            this.props.onClickEmptyArea();
     };
 
     onKeyDown = (e: React.KeyboardEvent) => {

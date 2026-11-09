@@ -865,7 +865,7 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
         flow = self.view.get_by_id("42")
         flow.response.raw_content = None
         flow.response.timestamp_end = None
-        flow.response.headers["content-type"] = "text/event-stream"
+        flow.response.headers["content-type"] = "application/octet-stream"
         flow.response.stream = True
         self.master.stream_preview.responseheaders(flow)
         for client in (watched, other):

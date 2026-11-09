@@ -116,20 +116,24 @@ exports[`FlowView 1`] = `
         <div
           class="kv-row"
         >
-          <span
-            class="inline-input kv-key"
-            tabindex="0"
+          <div
+            class="kv-row-content"
           >
-            header
-          </span>
-          : 
-          <span
-            class="inline-input kv-value"
-            placeholder="empty"
-            tabindex="0"
-          >
-            qvalue
-          </span>
+            <span
+              class="inline-input kv-key"
+              tabindex="0"
+            >
+              header
+            </span>
+            : 
+            <span
+              class="inline-input kv-value"
+              placeholder="empty"
+              tabindex="0"
+            >
+              qvalue
+            </span>
+          </div>
           <span
             class="kv-row-action"
           >
@@ -161,20 +165,24 @@ exports[`FlowView 1`] = `
         <div
           class="kv-row"
         >
-          <span
-            class="inline-input kv-key"
-            tabindex="0"
+          <div
+            class="kv-row-content"
           >
-            content-length
-          </span>
-          : 
-          <span
-            class="inline-input kv-value"
-            placeholder="empty"
-            tabindex="0"
-          >
-            7
-          </span>
+            <span
+              class="inline-input kv-key"
+              tabindex="0"
+            >
+              content-length
+            </span>
+            : 
+            <span
+              class="inline-input kv-value"
+              placeholder="empty"
+              tabindex="0"
+            >
+              7
+            </span>
+          </div>
           <span
             class="kv-row-action"
           >
@@ -468,20 +476,24 @@ exports[`FlowView 2`] = `
         <div
           class="kv-row"
         >
-          <span
-            class="inline-input kv-key"
-            tabindex="0"
+          <div
+            class="kv-row-content"
           >
-            header-response
-          </span>
-          : 
-          <span
-            class="inline-input kv-value"
-            placeholder="empty"
-            tabindex="0"
-          >
-            svalue
-          </span>
+            <span
+              class="inline-input kv-key"
+              tabindex="0"
+            >
+              header-response
+            </span>
+            : 
+            <span
+              class="inline-input kv-value"
+              placeholder="empty"
+              tabindex="0"
+            >
+              svalue
+            </span>
+          </div>
           <span
             class="kv-row-action"
           >
@@ -513,20 +525,24 @@ exports[`FlowView 2`] = `
         <div
           class="kv-row"
         >
-          <span
-            class="inline-input kv-key"
-            tabindex="0"
+          <div
+            class="kv-row-content"
           >
-            content-length
-          </span>
-          : 
-          <span
-            class="inline-input kv-value"
-            placeholder="empty"
-            tabindex="0"
-          >
-            7
-          </span>
+            <span
+              class="inline-input kv-key"
+              tabindex="0"
+            >
+              content-length
+            </span>
+            : 
+            <span
+              class="inline-input kv-value"
+              placeholder="empty"
+              tabindex="0"
+            >
+              7
+            </span>
+          </div>
           <span
             class="kv-row-action"
           >

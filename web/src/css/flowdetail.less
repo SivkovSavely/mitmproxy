@@ -150,6 +150,13 @@
 .trailers {
     .kv-row {
         margin-bottom: 0.3em;
+        display: flex;
+        align-items: flex-start;
+    }
+
+    .kv-row-content {
+        min-width: 0;
+        flex: 1;
         max-height: 12.4ex;
         overflow-y: auto;
     }
@@ -164,7 +171,8 @@
         transition: all 100ms ease-in-out;
     }
 
-    .kv-row:hover .kv-row-action {
+    .kv-row:hover .kv-row-action,
+    .kv-row:focus-within .kv-row-action {
         opacity: 1;
     }
 

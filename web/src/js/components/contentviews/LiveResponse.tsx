@@ -24,7 +24,8 @@ export default function LiveResponse({ state }: { state: PreviewState }) {
             {status === "waiting" && <p>Waiting for response bytes...</p>}
             {preview?.reason && (
                 <p role="note">
-                    Preview unavailable or interrupted: {preview.reason}
+                    Preview {state.bytes ? "interrupted" : "unavailable"}:{" "}
+                    {preview.reason}
                 </p>
             )}
             {(preview?.missing ||

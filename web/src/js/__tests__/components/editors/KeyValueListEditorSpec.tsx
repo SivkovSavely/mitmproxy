@@ -40,6 +40,28 @@ describe("KeyValueListEditor row actions", () => {
         expect(onChange).not.toHaveBeenCalled();
     });
 
+    it("keeps header text together and the action outside its scroll content", () => {
+        const { container } = render(
+            <KeyValueListEditor
+                className="headers"
+                data={[["X-Long", "a".repeat(500)]]}
+                onChange={() => {}}
+                rowAction={() => <button>filter</button>}
+            />,
+        );
+        const row = container.querySelector(".kv-row")!;
+        const content = row.querySelector(".kv-row-content")!;
+        const action = row.querySelector(".kv-row-action")!;
+        expect(content.textContent).toBe(`X-Long:\u00a0${"a".repeat(500)}`);
+        expect(content.parentElement).toBe(row);
+        expect(action.parentElement).toBe(row);
+        expect(content.contains(action)).toBe(false);
+        const value = content.querySelector<HTMLSpanElement>(".kv-value")!;
+        fireEvent.focus(value);
+        expect(value.contentEditable).toBe("true");
+        expect(value.textContent).toBe("a".repeat(500));
+    });
+
     it("invokes the row's own item on click", () => {
         const clicks = jest.fn();
         render(

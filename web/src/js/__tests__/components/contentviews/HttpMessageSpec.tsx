@@ -388,6 +388,63 @@ describe("live response lifecycle", () => {
         expect(fetchMock).not.toHaveBeenCalled();
     });
 
+    test("unpreviewable bytes report progress and a reason without a buffer-overflow warning", () => {
+        const flow = liveFlow();
+        const store = TStore();
+        store.dispatch(subscribe({ flow_id: flow.id, subscription: 1 }));
+        store.dispatch(
+            receive({
+                ...preview,
+                flow_id: flow.id,
+                end: 181670,
+                received: 181670,
+                reason: "Binary content: NUL byte",
+                text: "",
+            }),
+        );
+        render(<HttpMessage flow={flow} message={flow.response} />, { store });
+        expect(
+            screen.getByText(/181670 bytes received; 0 bytes shown/),
+        ).toBeInTheDocument();
+        expect(
+            screen.getByText("Preview unavailable: Binary content: NUL byte"),
+        ).toBeInTheDocument();
+        expect(screen.queryByText(/Incomplete preview/)).toBeNull();
+        expect(screen.queryByText(/Dropped source bytes/)).toBeNull();
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    test("a preview rejected after readable text retains that text with an interruption reason", () => {
+        const flow = liveFlow();
+        const store = TStore();
+        store.dispatch(subscribe({ flow_id: flow.id, subscription: 1 }));
+        store.dispatch(receive({ ...preview, flow_id: flow.id }));
+        render(<HttpMessage flow={flow} message={flow.response} />, { store });
+        act(() => {
+            store.dispatch(
+                receive({
+                    ...preview,
+                    flow_id: flow.id,
+                    seq: 2,
+                    start: 4,
+                    end: 5,
+                    received: 5,
+                    reason: "Invalid UTF-8",
+                    text: "",
+                    reset: false,
+                }),
+            );
+        });
+        expect(screen.getByLabelText("Live response text").textContent).toBe(
+            "live",
+        );
+        expect(
+            screen.getByText("Preview interrupted: Invalid UTF-8"),
+        ).toBeInTheDocument();
+        expect(screen.queryByText(/Dropped source bytes/)).toBeNull();
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
     test("a different flow or cleared session uses normal content, never stale preview", async () => {
         fetchMock.mockResponse(
             JSON.stringify({

@@ -44,7 +44,10 @@ class Preview:
     response: http.Response
     reason: str | None
     encoding: str = "utf-8"
+    detector: codecs.IncrementalDecoder | None = None
+    detect_skip: int = 0
     received: int = 0
+    dropped: int = 0
     status: str = "waiting"
     terminal_reason: str | None = None
     stored: bool = False
@@ -89,26 +92,31 @@ class StreamPreviewManager:
         reason = None
         content_type = Message()
         content_type["content-type"] = response.headers.get("content-type", "")
-        media = content_type.get_content_type().lower()
+        media = (
+            response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        )
         charset = content_type.get_content_charset() or "utf-8"
+        is_text = (
+            media.startswith("text/")
+            or media == "application/json"
+            or (media.startswith("application/") and media.endswith("+json"))
+        )
         if response.headers.get("content-encoding", "identity").lower().strip() not in (
             "",
             "identity",
         ):
             reason = "Unsupported content encoding"
-        elif not response.headers.get("content-type", "").strip() or not (
-            media.startswith("text/")
-            or media == "application/json"
-            or (media.startswith("application/") and media.endswith("+json"))
-        ):
-            reason = "Unsupported content type"
         elif charset.lower() not in ("utf-8", "utf8", "ascii", "us-ascii"):
             reason = "Unsupported charset"
+        encoding = "ascii" if charset.lower() in ("ascii", "us-ascii") else "utf-8"
         state = Preview(
             flow,
             response,
             reason,
-            encoding="ascii" if charset.lower() in ("ascii", "us-ascii") else "utf-8",
+            encoding=encoding,
+            detector=codecs.getincrementaldecoder(encoding)("strict")
+            if not is_text and not reason
+            else None,
         )
         self.active[flow.id] = state
         response._stream_observer = lambda chunk: self._observe(state, chunk)
@@ -121,20 +129,49 @@ class StreamPreviewManager:
         state.status = "streaming"
         cap = self.options.web_stream_preview_max_bytes
         if state.subscribers and not state.reason and cap:
-            chunk = chunk[-cap:]
-            pos = 0
-            while pos < len(chunk):
-                if not state.blocks or len(state.blocks[-1]) == 16384:
-                    state.blocks.append(bytearray())
-                n = min(16384 - len(state.blocks[-1]), len(chunk) - pos)
-                state.blocks[-1].extend(chunk[pos : pos + n])
-                state.size += n
-                pos += n
-            self._trim(state, cap)
+            if state.detector:
+                self._detect_text(state, chunk)
+            if not state.reason:
+                chunk = chunk[-cap:]
+                pos = 0
+                while pos < len(chunk):
+                    if not state.blocks or len(state.blocks[-1]) == 16384:
+                        state.blocks.append(bytearray())
+                    n = min(16384 - len(state.blocks[-1]), len(chunk) - pos)
+                    state.blocks[-1].extend(chunk[pos : pos + n])
+                    state.size += n
+                    pos += n
+                self._trim(state, cap)
         if state.subscribers and state.timer is None:
             state.timer = asyncio.get_running_loop().call_later(
                 0.2, self._notify, state
             )
+
+    def _detect_text(self, state: Preview, chunk: bytes) -> None:
+        assert state.detector is not None
+        pos = 0
+        while state.detect_skip and pos < len(chunk) and chunk[pos] & 0xC0 == 0x80:
+            pos += 1
+            state.detect_skip -= 1
+        if pos < len(chunk):
+            state.detect_skip = 0
+        try:
+            data = memoryview(chunk)
+            for offset in range(pos, len(data), 16384):
+                text = state.detector.decode(data[offset : offset + 16384])
+                if "\x00" in text:
+                    state.reason = "Binary content: NUL byte"
+                elif any(
+                    (c < " " and c not in "\t\r\n") or "\x7f" <= c <= "\x9f"
+                    for c in text
+                ):
+                    state.reason = "Binary content: non-text control characters"
+                if state.reason:
+                    break
+        except UnicodeDecodeError:
+            state.reason = f"Invalid {state.encoding.upper()}"
+        if state.reason:
+            self._trim(state, 0)
 
     def _trim(self, state: Preview, cap: int) -> None:
         excess = max(0, state.size - cap)
@@ -147,6 +184,8 @@ class StreamPreviewManager:
                 del block[:n]
             state.size -= n
             excess -= n
+        if cap and state.size:
+            state.dropped = max(state.dropped, state.received - state.size)
 
     def _notify(self, state: Preview) -> None:
         state.timer = None
@@ -162,32 +201,34 @@ class StreamPreviewManager:
             or flow.response is not state.response_ref()
         ):
             return None
-        start = max(sub.cursor, state.received - state.size)
-        gap = start > sub.cursor
-        sub.dropped = max(sub.dropped, state.received - state.size)
-        sub.missing |= sub.dropped > 0
-        skip = start - (state.received - state.size)
-        parts = []
-        for block in state.blocks:
-            if skip >= len(block):
-                skip -= len(block)
-            else:
-                parts.append(bytes(block[skip:]))
-                skip = 0
-        data = b"".join(parts)
-        if gap:
-            sub.decoder = codecs.getincrementaldecoder(state.encoding)("strict")
-            sub.aligning = True
-        if sub.aligning:
-            while data and data[0] & 0xC0 == 0x80:
-                data = data[1:]
-                start += 1
-            sub.dropped = max(sub.dropped, start)
-            if data:
-                sub.aligning = False
         reason = state.reason or sub.reason
+        sub.dropped = max(sub.dropped, state.dropped)
+        sub.missing |= sub.dropped > 0
+        start = sub.cursor
+        gap = False
         text = ""
         if not reason:
+            start = max(sub.cursor, state.received - state.size)
+            gap = start > sub.cursor
+            skip = start - (state.received - state.size)
+            parts = []
+            for block in state.blocks:
+                if skip >= len(block):
+                    skip -= len(block)
+                else:
+                    parts.append(bytes(block[skip:]))
+                    skip = 0
+            data = b"".join(parts)
+            if gap:
+                sub.decoder = codecs.getincrementaldecoder(state.encoding)("strict")
+                sub.aligning = True
+            if sub.aligning:
+                while data and data[0] & 0xC0 == 0x80:
+                    data = data[1:]
+                    start += 1
+                sub.dropped = max(sub.dropped, start)
+                if data:
+                    sub.aligning = False
             try:
                 text = sub.decoder.decode(
                     data, final=state.status in ("finished", "aborted")
@@ -274,6 +315,11 @@ class StreamPreviewManager:
         )
         sub.decoder = codecs.getincrementaldecoder(state.encoding)("strict")
         if self.active.get(flow_id) is state:
+            if state.detector and not state.subscribers:
+                state.detector.reset()
+                state.detect_skip = (
+                    3 if state.received and state.encoding == "utf-8" else 0
+                )
             state.subscribers.add(sub)
             self.clients[client] = state, sub
         client.queue_preview(lambda: self._payload(state, sub))
@@ -300,6 +346,14 @@ class StreamPreviewManager:
         self.active.pop(flow.id)
         state.response._stream_observer = None
         state.status = status
+        if state.detector and not state.reason:
+            try:
+                state.detector.decode(b"", final=True)
+            except UnicodeDecodeError:
+                state.reason = (
+                    f"Incomplete {state.encoding.upper()} sequence at end of stream"
+                )
+                self._trim(state, 0)
         if status == "aborted" and flow.error:
             state.terminal_reason = flow.error.msg
         self.finished.add(state)

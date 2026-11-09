@@ -67,8 +67,12 @@ async def test_subscription_delta_and_gap(setup):
 
 
 @pytest.mark.asyncio
-async def test_utf8_join_coalescing_and_disconnect(setup):
+@pytest.mark.parametrize("content_type", ["text/plain; charset=utf-8", None])
+async def test_utf8_join_coalescing_and_disconnect(setup, content_type):
     manager, _, _, flow = setup
+    if content_type is None:
+        del flow.response.headers["content-type"]
+    manager.responseheaders(flow)
     a, b = Sink(), Sink()
     original = flow.response.raw_content
     stream = flow.response.stream
@@ -93,25 +97,34 @@ async def test_utf8_join_coalescing_and_disconnect(setup):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "header,value,reason",
+    "header,value,body,reason",
     [
-        ("content-type", "application/octet-stream", "content type"),
-        ("content-type", "text/plain; charset=latin-1", "charset"),
-        ("content-encoding", "gzip", "encoding"),
+        ("content-type", "application/octet-stream", b"\x00secret", "binary"),
+        ("content-type", "text/plain; charset=latin-1", b"secret", "charset"),
+        (
+            "content-type",
+            "application/octet-stream; charset=utf-16",
+            b"secret",
+            "charset",
+        ),
+        ("content-encoding", "gzip", b"secret", "encoding"),
+        ("content-encoding", "br", b"secret", "encoding"),
     ],
 )
-async def test_unsupported(setup, header, value, reason):
+async def test_unsupported(setup, header, value, body, reason):
     manager, _, _, flow = setup
     flow.response.headers[header] = value
     manager.responseheaders(flow)
     sink = Sink()
     manager.subscribe(sink, flow.id, 1)
     sink.drain()
-    flow.response._observe_stream_chunk(b"secret")
+    flow.response._observe_stream_chunk(body)
     await asyncio.sleep(0.22)
     payload = sink.drain()
-    assert payload["received"] == 6 and payload["text"] == ""
+    assert payload["received"] == len(body) and payload["text"] == ""
     assert reason in payload["reason"].lower()
+    assert payload["start"] == 0 and payload["end"] == len(body)
+    assert payload["dropped"] == 0 and not payload["missing"]
     assert not manager.active[flow.id].blocks
 
 
@@ -306,18 +319,237 @@ async def test_disabled_headers_and_runtime_disable(setup):
 
 
 @pytest.mark.asyncio
-async def test_missing_content_type_is_not_text(setup):
+@pytest.mark.parametrize(
+    "body,text,reason",
+    [
+        (b"data: ok\n\n", "data: ok\n\n", None),
+        (b"\x00binary", "", "Binary content: NUL byte"),
+    ],
+)
+async def test_missing_content_type_is_detected_from_body(setup, body, text, reason):
+    manager, _, opts, flow = setup
+    opts.web_stream_preview_max_bytes = 64
+    del flow.response.headers["content-type"]
+    manager.responseheaders(flow)
+    sink = Sink()
+    manager.subscribe(sink, flow.id, 1)
+    sink.drain()
+    flow.response._observe_stream_chunk(body)
+    await asyncio.sleep(0.22)
+    result = sink.drain()
+    assert result["text"] == text and result["reason"] == reason
+    assert result["received"] == len(body)
+    assert result["dropped"] == 0 and not result["missing"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "text/event-stream",
+        "application/json",
+        "application/octet-stream",
+        "application/x-ndjson",
+        "image/png",
+        "nonstandard",
+    ],
+)
+async def test_text_is_visible_before_completion_regardless_of_mime(
+    setup, content_type
+):
+    manager, _, opts, flow = setup
+    opts.web_stream_preview_max_bytes = 64
+    flow.response.headers["content-type"] = content_type
+    manager.responseheaders(flow)
+    original = flow.get_state()
+    sink = Sink()
+    manager.subscribe(sink, flow.id, 1)
+    assert sink.drain()["reason"] is None
+    flow.response._observe_stream_chunk(b"d")
+    await asyncio.sleep(0.22)
+    first = sink.drain()
+    assert first["text"] == "d" and first["status"] == "streaming"
+    assert first["received"] == 1 and first["reason"] is None
+    flow.response._observe_stream_chunk(b"ata: \xc3\xa9\r\n\r\n")
+    await asyncio.sleep(0.22)
+    second = sink.drain()
+    assert second["text"] == "ata: \u00e9\r\n\r\n" and second["reason"] is None
+    assert (second["start"], second["end"], second["dropped"]) == (1, 12, 0)
+    assert flow.get_state() == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_type", ["application/octet-stream", "nonstandard"])
+@pytest.mark.parametrize(
+    "body,reason",
+    [
+        (b"a\x00b", "NUL byte"),
+        (b"\xff", "Invalid UTF-8"),
+        (b"\xc3(", "Invalid UTF-8"),
+        (b"\x01abc", "control characters"),
+        (b"\x7f", "control characters"),
+        (b"\xc2\x85", "control characters"),
+        (b"\x1b[31mred", "control characters"),
+        (b"\x00" + b"a" * 65536, "NUL byte"),
+    ],
+)
+async def test_unknown_type_rejects_binary_without_false_overflow(
+    setup, content_type, body, reason
+):
+    manager, _, _, flow = setup
+    flow.response.headers["content-type"] = content_type
+    manager.responseheaders(flow)
+    sink = Sink()
+    manager.subscribe(sink, flow.id, 1)
+    sink.drain()
+    flow.response._observe_stream_chunk(body)
+    await asyncio.sleep(0.22)
+    result = sink.drain()
+    assert reason in result["reason"] and result["text"] == ""
+    assert result["received"] == len(body)
+    assert result["dropped"] == 0 and not result["missing"]
+    assert not manager.active[flow.id].blocks
+
+
+@pytest.mark.asyncio
+async def test_unknown_type_stops_if_utf8_becomes_invalid(setup):
     manager, _, _, flow = setup
     del flow.response.headers["content-type"]
     manager.responseheaders(flow)
     sink = Sink()
     manager.subscribe(sink, flow.id, 1)
     sink.drain()
-    flow.response._observe_stream_chunk(b"printable binary")
+    flow.response._observe_stream_chunk(b"text\r\n")
+    await asyncio.sleep(0.22)
+    assert sink.drain()["text"] == "text\r\n"
+    flow.response._observe_stream_chunk(b"\xff")
     await asyncio.sleep(0.22)
     result = sink.drain()
-    assert result["text"] == "" and result["reason"] == "Unsupported content type"
-    assert not manager.active[flow.id].blocks
+    assert result["reason"] == "Invalid UTF-8" and result["text"] == ""
+    assert (result["start"], result["end"], result["dropped"]) == (6, 7, 0)
+    assert not result["reset"] and not result["missing"]
+    flow.response._observe_stream_chunk(b"later")
+    manager.response(flow)
+    result = sink.drain()
+    assert result["received"] == 12 and result["text"] == ""
+    assert result["reason"] == "Invalid UTF-8" and result["dropped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unknown_type_detection_is_bounded_and_resumes_after_unwatched_gap(setup):
+    manager, _, _, flow = setup
+    del flow.response.headers["content-type"]
+    manager.responseheaders(flow)
+    sink = Sink()
+    manager.subscribe(sink, flow.id, 1)
+    sink.drain()
+    flow.response._observe_stream_chunk(b"a" * 100000 + b"\xe2")
+    state = manager.active[flow.id]
+    assert state.size == 8 and sum(map(len, state.blocks)) == 8
+    await asyncio.sleep(0.22)
+    result = sink.drain()
+    assert result["text"] == "aaaaaaa" and result["reason"] is None
+    assert result["dropped"] == 99993 and result["missing"]
+    manager.unsubscribe(sink)
+    flow.response._observe_stream_chunk(b"\x82\xac skipped\xe2")
+    assert not state.blocks
+    manager.subscribe(sink, flow.id, 2)
+    assert sink.drain()["missing"]
+    flow.response._observe_stream_chunk(b"\x82\xacnew")
+    await asyncio.sleep(0.22)
+    result = sink.drain()
+    assert result["text"] == "new" and result["reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_type_split_utf8_and_incomplete_final_sequence(setup):
+    manager, _, _, flow = setup
+    del flow.response.headers["content-type"]
+    manager.responseheaders(flow)
+    sink = Sink()
+    manager.subscribe(sink, flow.id, 1)
+    sink.drain()
+    for chunk, text in [(b"A\xe2", "A"), (b"\x82", ""), (b"\xac\r\n", "\u20ac\r\n")]:
+        flow.response._observe_stream_chunk(chunk)
+        await asyncio.sleep(0.22)
+        result = sink.drain()
+        assert result["text"] == text and result["reason"] is None
+    assert result["received"] == 6 and not result["missing"]
+    flow.response._observe_stream_chunk(b"\xe2")
+    await asyncio.sleep(0.22)
+    assert sink.drain()["reason"] is None
+    manager.response(flow)
+    result = sink.drain()
+    assert "UTF-8" in result["reason"] and result["received"] == 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "charset,chunks,reason,text",
+    [
+        ("ascii", [b"\x80hello"], "Invalid ASCII", ""),
+        ("utf-8", [b"\x80\x80\x80\x80hello"], "Invalid UTF-8", ""),
+        ("utf-8", [b"\x80", b"\x80", b"\x80", b"\x80hello"], "Invalid UTF-8", ""),
+        ("utf-8", [b"\x80", b"\x80", b"\x80hello"], None, "hello"),
+    ],
+)
+async def test_unknown_type_late_join_only_skips_a_plausible_utf8_boundary(
+    setup, charset, chunks, reason, text
+):
+    manager, _, _, flow = setup
+    flow.response.headers["content-type"] = (
+        f"application/octet-stream; charset={charset}"
+    )
+    manager.responseheaders(flow)
+    flow.response._observe_stream_chunk(b"\xf0")
+    sink = Sink()
+    manager.subscribe(sink, flow.id, 1)
+    assert sink.drain()["missing"]
+    for chunk in chunks:
+        flow.response._observe_stream_chunk(chunk)
+    await asyncio.sleep(0.22)
+    result = sink.drain()
+    assert result["reason"] == reason and result["text"] == text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook", ["response", "error"])
+async def test_unknown_type_finalizes_utf8_even_if_cap_hides_incomplete_sequence(
+    setup, hook
+):
+    manager, _, opts, flow = setup
+    opts.web_stream_preview_max_bytes = 1
+    del flow.response.headers["content-type"]
+    manager.responseheaders(flow)
+    sink = Sink()
+    manager.subscribe(sink, flow.id, 1)
+    sink.drain()
+    flow.response._observe_stream_chunk(b"\xe2\x82")
+    getattr(manager, hook)(flow)
+    result = sink.drain()
+    assert "Incomplete UTF-8" in result["reason"]
+    assert result["received"] == 2 and result["text"] == ""
+
+
+@pytest.mark.asyncio
+async def test_unknown_type_retains_real_overflow_count_after_binary_detection(setup):
+    manager, _, _, flow = setup
+    del flow.response.headers["content-type"]
+    manager.responseheaders(flow)
+    sink = Sink()
+    manager.subscribe(sink, flow.id, 1)
+    sink.drain()
+    flow.response._observe_stream_chunk(b"abcdefghij")
+    flow.response._observe_stream_chunk(b"\x00")
+    await asyncio.sleep(0.22)
+    result = sink.drain()
+    assert result["reason"] == "Binary content: NUL byte"
+    assert result["received"] == 11 and result["text"] == ""
+    assert result["dropped"] == 2 and result["missing"]
+    flow.response._observe_stream_chunk(b"more")
+    manager.response(flow)
+    result = sink.drain()
+    assert result["received"] == 15 and result["dropped"] == 2
 
 
 @pytest.mark.asyncio
