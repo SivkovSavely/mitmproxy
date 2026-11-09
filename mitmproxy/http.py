@@ -1016,6 +1016,14 @@ class Response(Message):
     """
 
     data: ResponseData
+    _stream_observer: Callable[[bytes], None] | None = None
+
+    def _observe_stream_chunk(self, chunk: bytes) -> None:
+        if self._stream_observer is not None:
+            try:
+                self._stream_observer(chunk)
+            except Exception:
+                self._stream_observer = None
 
     def __init__(
         self,

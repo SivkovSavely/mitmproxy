@@ -94,6 +94,13 @@ class WebAddon:
         loader.add_option("web_debug", bool, False, "Enable mitmweb debugging.")
         loader.add_option("web_port", int, 8081, "Web UI port.")
         loader.add_option(
+            "web_stream_preview_max_bytes",
+            int,
+            1048576,
+            "Maximum bytes retained for a watched live response preview in mitmweb. "
+            "Set to 0 to disable live previews.",
+        )
+        loader.add_option(
             "web_json_eager_parse_max_bytes",
             int,
             2097152,
@@ -117,6 +124,13 @@ class WebAddon:
         )
 
     def configure(self, updated) -> None:
+        if (
+            "web_stream_preview_max_bytes" in updated
+            and ctx.options.web_stream_preview_max_bytes < 0
+        ):
+            raise exceptions.OptionsError(
+                "web_stream_preview_max_bytes must be zero or greater."
+            )
         if (
             "web_json_eager_parse_max_bytes" in updated
             and ctx.options.web_json_eager_parse_max_bytes < 0

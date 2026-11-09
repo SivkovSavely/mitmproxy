@@ -178,6 +178,8 @@ def flow_to_json(flow: mitmproxy.flow.Flow) -> dict:
                 "timestamp_start": flow.response.timestamp_start,
                 "timestamp_end": flow.response.timestamp_end,
             }
+            if flow.response._stream_observer is not None:
+                f["response"]["stream_preview"] = True
             if flow.response.data.trailers:
                 f["response"]["trailers"] = tuple(
                     flow.response.data.trailers.items(True)
@@ -381,7 +383,7 @@ class WebSocketEventBroadcaster(tornado.websocket.WebSocketHandler, AuthRequestH
     # raise an error if inherited class doesn't specify its own instance.
     connections: ClassVar[set[WebSocketEventBroadcaster]]
 
-    _send_queue: asyncio.Queue[bytes]
+    _send_queue: asyncio.Queue[bytes | None]
     _send_task: asyncio.Task[None]
 
     def prepare(self) -> Optional[Awaitable[None]]:
@@ -415,10 +417,18 @@ class WebSocketEventBroadcaster(tornado.websocket.WebSocketHandler, AuthRequestH
     async def send_task(self):
         while True:
             message = await self._send_queue.get()
+            if message is None:
+                message = self.take_preview()
+                if message is None:
+                    continue
             try:
                 await self.write_message(message)
             except tornado.websocket.WebSocketClosedError:
                 self.on_close()
+                return
+
+    def take_preview(self) -> bytes | None:
+        return None
 
     @staticmethod
     def _json_dumps(d):
@@ -432,6 +442,36 @@ class ClientConnection(WebSocketEventBroadcaster):
     def __init__(self, application: Application, request, **kwargs):
         super().__init__(application, request, **kwargs)
         self.filters: dict[str, flowfilter.TFilter] = {}  # filters per connection
+        self._preview_pending: Callable[[], dict | None] | None = None
+        self._preview_queued = False
+
+    def queue_preview(self, factory: Callable[[], dict | None]) -> None:
+        self._preview_pending = factory
+        if not self._preview_queued:
+            self._preview_queued = True
+            self._send_queue.put_nowait(None)
+
+    def clear_preview(self) -> None:
+        self._preview_pending = None
+
+    def take_preview(self) -> bytes | None:
+        factory, self._preview_pending = self._preview_pending, None
+        self._preview_queued = False
+        if factory:
+            try:
+                payload = factory()
+                if payload is not None:
+                    return self._json_dumps(
+                        {"type": "response/preview", "payload": payload}
+                    )
+            except Exception:
+                logger.exception("Unable to send response preview")
+                self.application.master.stream_preview.unsubscribe(self)
+        return None
+
+    def on_close(self):
+        self.application.master.stream_preview.unsubscribe(self)
+        super().on_close()
 
     @classmethod
     def broadcast_flow_reset(cls) -> None:
@@ -494,6 +534,11 @@ class ClientConnection(WebSocketEventBroadcaster):
             match data["type"]:
                 case "flows/updateFilter":
                     self.update_filter(data["payload"]["name"], data["payload"]["expr"])
+                case "flows/subscribeResponse":
+                    payload = data["payload"]
+                    self.application.master.stream_preview.subscribe(
+                        self, payload["flow_id"], payload["subscription"]
+                    )
                 case other:
                     raise ValueError(f"Unsupported command: {other}")
         except Exception as e:

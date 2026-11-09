@@ -7,8 +7,423 @@ import { JSON_WORD_WRAP_STORAGE_KEY } from "../../../components/helpers/usePersi
 import { act, fireEvent, render, screen, waitFor } from "../../test-utils";
 import { setContentViewFor } from "../../../ducks/ui/flow";
 import fetchMock, { enableFetchMocks } from "jest-fetch-mock";
+import { subscribe, receive } from "../../../ducks/responsePreview";
 
 enableFetchMocks();
+
+test("live response bypasses normal content fetching and preserves incremental SSE", () => {
+    fetchMock.resetMocks();
+    const flow = TFlow();
+    Object.assign(flow.response, {
+        stream_preview: true,
+        timestamp_end: undefined,
+        contentLength: 0,
+    });
+    const store = TStore();
+    store.dispatch({
+        type: "responsePreview/subscribe",
+        payload: { flow_id: flow.id, subscription: 1 },
+    });
+    const preview = {
+        flow_id: flow.id,
+        subscription: 1,
+        seq: 1,
+        start: 0,
+        end: 0,
+        received: 0,
+        dropped: 0,
+        missing: false,
+        status: "waiting",
+        reason: null,
+        text: "",
+        reset: true,
+        stored: false,
+        max_bytes: 32,
+    };
+    store.dispatch({ type: "responsePreview/receive", payload: preview });
+    render(<HttpMessage flow={flow} message={flow.response} />, { store });
+    expect(screen.getByText(/Waiting for response bytes/)).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+    act(() => {
+        store.dispatch({
+            type: "responsePreview/receive",
+            payload: {
+                ...preview,
+                seq: 2,
+                end: 9,
+                received: 9,
+                status: "streaming",
+                reset: false,
+                text: "data: a\n\n",
+            },
+        });
+    });
+    const body = screen.getByLabelText("Live response text");
+    expect(body.textContent).toBe("data: a\n\n");
+    body.scrollTop = 4;
+    const firstNode = body.firstChild;
+    act(() => {
+        store.dispatch({
+            type: "responsePreview/receive",
+            payload: {
+                ...preview,
+                seq: 3,
+                start: 9,
+                end: 18,
+                received: 18,
+                status: "streaming",
+                reset: false,
+                text: "data: b\n\n",
+            },
+        });
+    });
+    expect(body.textContent).toBe("data: a\n\ndata: b\n\n");
+    expect(body.firstChild).toBe(firstNode);
+    expect(body.scrollTop).toBe(4);
+    expect(screen.getByText(/18 bytes received/)).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+});
+
+describe("live response lifecycle", () => {
+    function liveFlow() {
+        const flow = TFlow();
+        Object.assign(flow.response, {
+            stream_preview: true,
+            timestamp_end: undefined,
+            contentHash: undefined,
+            contentLength: 0,
+        });
+        return flow;
+    }
+    const preview = {
+        flow_id: "",
+        subscription: 1,
+        seq: 1,
+        start: 0,
+        end: 4,
+        received: 4,
+        dropped: 0,
+        missing: false,
+        status: "streaming" as const,
+        reason: null,
+        text: "live",
+        reset: true,
+        stored: false,
+        max_bytes: 8,
+    };
+
+    beforeEach(() => fetchMock.resetMocks());
+
+    test("nonstored terminal preview survives canonical completion until session changes", () => {
+        const flow = liveFlow();
+        const store = TStore();
+        store.dispatch(subscribe({ flow_id: flow.id, subscription: 1 }));
+        store.dispatch(receive({ ...preview, flow_id: flow.id }));
+        const view = render(
+            <HttpMessage flow={flow} message={flow.response} />,
+            { store },
+        );
+        const completed = {
+            ...flow,
+            response: {
+                ...flow.response,
+                timestamp_end: 100,
+                stream_preview: false,
+                contentLength: undefined,
+            },
+        };
+        view.rerender(
+            <HttpMessage flow={completed} message={completed.response} />,
+        );
+        expect(screen.getByLabelText("Live response text").textContent).toBe(
+            "live",
+        );
+        act(() => {
+            store.dispatch(
+                receive({
+                    ...preview,
+                    flow_id: flow.id,
+                    seq: 2,
+                    status: "finished",
+                    start: 4,
+                    text: "",
+                    reset: false,
+                }),
+            );
+        });
+        expect(
+            screen.getByText("Finished response preview"),
+        ).toBeInTheDocument();
+        expect(screen.getByText(/Full body not retained/)).toBeInTheDocument();
+        expect(screen.getByLabelText("Live response text").textContent).toBe(
+            "live",
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    test("stored terminal response returns to the existing content viewer", async () => {
+        fetchMock.mockResponse(
+            JSON.stringify({
+                view_name: "Raw",
+                description: "",
+                text: "full body",
+                syntax_highlight: "none",
+            }),
+        );
+        const flow = liveFlow();
+        const store = TStore();
+        store.dispatch(subscribe({ flow_id: flow.id, subscription: 1 }));
+        store.dispatch(receive({ ...preview, flow_id: flow.id }));
+        const view = render(
+            <HttpMessage flow={flow} message={flow.response} />,
+            { store },
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+        act(() => {
+            store.dispatch(
+                receive({
+                    ...preview,
+                    flow_id: flow.id,
+                    seq: 2,
+                    status: "finished",
+                    stored: true,
+                    start: 4,
+                    text: "",
+                    reset: false,
+                }),
+            );
+        });
+        expect(screen.getByLabelText("Live response text").textContent).toBe(
+            "live",
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+        const completed = {
+            ...flow,
+            response: {
+                ...flow.response,
+                stream_preview: false,
+                timestamp_end: 100,
+                contentLength: 9,
+                contentHash: "complete",
+            },
+        };
+        view.rerender(
+            <HttpMessage flow={completed} message={completed.response} />,
+        );
+        await waitFor(() =>
+            expect(screen.getByText("full body")).toBeInTheDocument(),
+        );
+        expect(screen.queryByLabelText("Live response text")).toBeNull();
+        expect(screen.getByText("Copy")).toBeInTheDocument();
+        expect(screen.getByText("Edit")).toBeInTheDocument();
+    });
+
+    test("stored aborted response keeps partial text and aborted status after canonical completion", () => {
+        const flow = liveFlow();
+        const store = TStore();
+        store.dispatch(subscribe({ flow_id: flow.id, subscription: 1 }));
+        store.dispatch(
+            receive({
+                ...preview,
+                flow_id: flow.id,
+                status: "aborted",
+                stored: true,
+                reason: "connection lost",
+            }),
+        );
+        const view = render(
+            <HttpMessage flow={flow} message={flow.response} />,
+            { store },
+        );
+        const completed = {
+            ...flow,
+            response: {
+                ...flow.response,
+                stream_preview: false,
+                timestamp_end: 100,
+                contentHash: "partial",
+                contentLength: 4,
+            },
+        };
+        view.rerender(
+            <HttpMessage flow={completed} message={completed.response} />,
+        );
+        expect(
+            screen.getByText("Aborted response preview"),
+        ).toBeInTheDocument();
+        expect(screen.getByLabelText("Live response text").textContent).toBe(
+            "live",
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    test.each(["finished", "streaming"] as const)(
+        "completed canonical body replaces %s nonstored preview",
+        async (status) => {
+            fetchMock.mockResponse(
+                JSON.stringify({
+                    view_name: "Raw",
+                    description: "",
+                    text: "replacement",
+                    syntax_highlight: "none",
+                }),
+            );
+            const flow = liveFlow();
+            const store = TStore();
+            store.dispatch(subscribe({ flow_id: flow.id, subscription: 1 }));
+            store.dispatch(receive({ ...preview, flow_id: flow.id, status }));
+            const view = render(
+                <HttpMessage flow={flow} message={flow.response} />,
+                { store },
+            );
+            expect(fetchMock).not.toHaveBeenCalled();
+            const completed = {
+                ...flow,
+                response: {
+                    ...flow.response,
+                    stream_preview: false,
+                    timestamp_end: 100,
+                    contentHash: "replacement",
+                    contentLength: 11,
+                },
+            };
+            view.rerender(
+                <HttpMessage flow={completed} message={completed.response} />,
+            );
+            await waitFor(() =>
+                expect(screen.getByText("replacement")).toBeInTheDocument(),
+            );
+            expect(screen.queryByLabelText("Live response text")).toBeNull();
+        },
+    );
+
+    test("stored finished preview waits for both completion and canonical body metadata", () => {
+        const flow = liveFlow();
+        const store = TStore();
+        store.dispatch(subscribe({ flow_id: flow.id, subscription: 1 }));
+        store.dispatch(
+            receive({
+                ...preview,
+                flow_id: flow.id,
+                status: "finished",
+                stored: true,
+            }),
+        );
+        const view = render(
+            <HttpMessage flow={flow} message={flow.response} />,
+            { store },
+        );
+        for (const response of [
+            {
+                ...flow.response,
+                stream_preview: false,
+                timestamp_end: undefined,
+            },
+            { ...flow.response, stream_preview: true, timestamp_end: 100 },
+            {
+                ...flow.response,
+                stream_preview: false,
+                timestamp_end: 100,
+                contentLength: undefined,
+                contentHash: undefined,
+            },
+        ]) {
+            const updated = { ...flow, response };
+            view.rerender(<HttpMessage flow={updated} message={response} />);
+            expect(
+                screen.getByLabelText("Live response text").textContent,
+            ).toBe("live");
+            expect(fetchMock).not.toHaveBeenCalled();
+        }
+    });
+
+    test("reports bounded tails, missing source bytes and unsupported/aborted reasons", () => {
+        const flow = liveFlow();
+        const store = TStore();
+        store.dispatch(subscribe({ flow_id: flow.id, subscription: 1 }));
+        store.dispatch(
+            receive({
+                ...preview,
+                flow_id: flow.id,
+                start: 20,
+                end: 32,
+                received: 32,
+                dropped: 20,
+                missing: true,
+                text: "abcdefghijkl",
+            }),
+        );
+        render(<HttpMessage flow={flow} message={flow.response} />, { store });
+        expect(screen.getByLabelText("Live response text").textContent).toBe(
+            "efghijkl",
+        );
+        expect(
+            screen.getByText(/Dropped source bytes: 20/),
+        ).toBeInTheDocument();
+        expect(
+            screen.getByText(/limited to 8 UTF-8 bytes/),
+        ).toBeInTheDocument();
+        act(() => {
+            store.dispatch(
+                receive({
+                    ...preview,
+                    flow_id: flow.id,
+                    seq: 2,
+                    start: 32,
+                    end: 32,
+                    received: 32,
+                    status: "aborted",
+                    reason: "Unsupported content encoding: gzip",
+                    text: "",
+                    reset: false,
+                }),
+            );
+        });
+        expect(
+            screen.getByText("Aborted response preview"),
+        ).toBeInTheDocument();
+        expect(
+            screen.getByText(/Unsupported content encoding: gzip/),
+        ).toBeInTheDocument();
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    test("a different flow or cleared session uses normal content, never stale preview", async () => {
+        fetchMock.mockResponse(
+            JSON.stringify({
+                view_name: "Raw",
+                description: "",
+                text: "normal",
+                syntax_highlight: "none",
+            }),
+        );
+        const flow = liveFlow();
+        const other = { ...TFlow(), id: "other" };
+        const store = TStore();
+        store.dispatch(subscribe({ flow_id: flow.id, subscription: 1 }));
+        store.dispatch(receive({ ...preview, flow_id: flow.id }));
+        const view = render(
+            <HttpMessage flow={flow} message={flow.response} />,
+            { store },
+        );
+        view.rerender(<HttpMessage flow={other} message={other.response} />);
+        await waitFor(() =>
+            expect(screen.getByText("normal")).toBeInTheDocument(),
+        );
+        expect(screen.queryByLabelText("Live response text")).toBeNull();
+        act(() => {
+            store.dispatch(subscribe({ flow_id: null, subscription: 2 }));
+        });
+        const completed = TFlow();
+        view.rerender(
+            <HttpMessage flow={completed} message={completed.response} />,
+        );
+        await waitFor(() =>
+            expect(screen.getByText("normal")).toBeInTheDocument(),
+        );
+        expect(screen.queryByLabelText("Live response text")).toBeNull();
+    });
+});
 
 type CapturedCodeEditorProps = {
     initialContent: string;
@@ -401,9 +816,7 @@ describe("HttpMessage JSON view", () => {
         first.unmount();
 
         render(<HttpMessage flow={tflow} message={tflow.request} />);
-        await waitFor(() =>
-            screen.getByRole("button", { name: "Wrap" }),
-        );
+        await waitFor(() => screen.getByRole("button", { name: "Wrap" }));
         await expectJsonEditor('{"request": true}', true, true);
         expect(screen.getByRole("button", { name: "Wrap" })).toHaveAttribute(
             "aria-pressed",
@@ -711,8 +1124,8 @@ describe("HttpMessage JSON view", () => {
     });
 
     test("truncated json shows maxLines lines plus Show more", async () => {
-        const fullJson = '{\n' + '"line",\n'.repeat(512) + '"last"\n}';
-        const truncatedJson = '{\n' + '"line",\n'.repeat(512);
+        const fullJson = "{\n" + '"line",\n'.repeat(512) + '"last"\n}';
+        const truncatedJson = "{\n" + '"line",\n'.repeat(512);
         fetchMock.mockResponses(
             JSON.stringify({ text: truncatedJson, ...cvdJson }),
             JSON.stringify({ text: fullJson, ...cvdJson }),
@@ -733,9 +1146,7 @@ describe("HttpMessage JSON view", () => {
             fetchMock.mock.calls
                 .map(([url]) => String(url))
                 .filter((url) => url.includes("/content/"));
-        expect(contentUrls()).toEqual([
-            expect.stringContaining("?lines=513"),
-        ]);
+        expect(contentUrls()).toEqual([expect.stringContaining("?lines=513")]);
 
         fireEvent.click(screen.getByText("Show more"));
         await waitFor(() => {

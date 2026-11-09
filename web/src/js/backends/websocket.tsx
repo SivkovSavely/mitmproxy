@@ -12,6 +12,8 @@ import { EVENTS_ADD, EVENTS_RECEIVE } from "../ducks/eventLog";
 import { OPTIONS_RECEIVE, OPTIONS_UPDATE } from "../ducks/options";
 import { SCRIPTS_RECEIVE } from "../ducks/scripts";
 import type { ScriptStatus } from "../ducks/scripts";
+import * as responsePreview from "../ducks/responsePreview";
+import { Tab } from "../ducks/ui/tabs";
 import {
     FLOWS_ADD,
     FLOWS_FILTER_UPDATE,
@@ -44,7 +46,8 @@ type WebsocketMessageType =
     | "events/reset"
     | "options/update"
     | "state/update"
-    | "scripts/update";
+    | "scripts/update"
+    | "response/preview";
 
 export default class WebsocketBackend {
     activeFetches: Partial<{ [key in Resource]: Array<Action> }>;
@@ -52,6 +55,11 @@ export default class WebsocketBackend {
     filterState: typeof initialFilterState;
     socket: WebSocket;
     messageQueue: Action[];
+    previewFlow: string | null = null;
+    previewResponseStart: number | undefined;
+    previewSubscription = 0;
+    previewDisconnected = false;
+    previewResetting = false;
 
     constructor(store) {
         this.activeFetches = {};
@@ -77,6 +85,7 @@ export default class WebsocketBackend {
     }
 
     async onOpen() {
+        this.previewDisconnected = false;
         // Send all queued messages.
         for (const message of this.messageQueue) {
             this.socket.send(JSON.stringify(message));
@@ -95,6 +104,7 @@ export default class WebsocketBackend {
     }
 
     onStoreUpdate() {
+        this.updateResponseSubscription();
         const storeFilterState = this.store.getState().ui.filter;
         if (storeFilterState === this.filterState) {
             return;
@@ -111,6 +121,56 @@ export default class WebsocketBackend {
             }
         }
         this.filterState = storeFilterState;
+    }
+
+    updateResponseSubscription() {
+        const state = this.store.getState();
+        const selected = state.flows.selected;
+        const flow = selected.length === 1 ? selected[0] : undefined;
+        const visible =
+            (state.ui.flow.tab === "response" ||
+                (state.ui.flow.tab === "error" &&
+                    flow?.type === "http" &&
+                    flow.response &&
+                    !flow.error)) &&
+            state.ui.tabs.current !== Tab.Capture &&
+            state.ui.tabs.current !== Tab.Scripts;
+        const connected =
+            this.socket.readyState === WebSocket.OPEN &&
+            !this.previewDisconnected &&
+            state.connection.state !== connectionActions.ConnectionState.ERROR;
+        // Keep a watched session through flow completion: its terminal preview can
+        // arrive after the canonical flow update, particularly for nonstored bodies.
+        const responseStart =
+            flow?.type === "http" ? flow.response?.timestamp_start : undefined;
+        const sameResponse =
+            this.previewFlow === flow?.id &&
+            this.previewResponseStart === responseStart;
+        const desired =
+            connected &&
+            visible &&
+            !this.previewResetting &&
+            !this.activeFetches[Resource.Flows] &&
+            flow?.type === "http" &&
+            flow.response &&
+            (sameResponse || flow.response.stream_preview === true)
+                ? flow.id
+                : null;
+        if (
+            desired !== this.previewFlow ||
+            (desired !== null && !sameResponse)
+        ) {
+            this.previewFlow = desired;
+            this.previewResponseStart =
+                desired === null ? undefined : responseStart;
+            const payload = {
+                flow_id: desired,
+                subscription: ++this.previewSubscription,
+            };
+            this.store.dispatch(responsePreview.subscribe(payload));
+            if (connected)
+                this.sendMessage({ type: "flows/subscribeResponse", payload });
+        }
     }
 
     fetchData(resource: Resource) {
@@ -131,6 +191,10 @@ export default class WebsocketBackend {
         scripts?: ScriptStatus[];
     }) {
         switch (msg.type) {
+            case "response/preview":
+                return this.store.dispatch(
+                    responsePreview.receive(msg.payload),
+                );
             case "flows/add":
                 return this.queueOrDispatch(
                     Resource.Flows,
@@ -172,6 +236,8 @@ export default class WebsocketBackend {
                     SCRIPTS_RECEIVE(msg.scripts ?? []),
                 );
             case "flows/reset":
+                this.previewResetting = true;
+                this.clearResponseSubscription();
                 return this.fetchData(Resource.Flows);
             case "events/reset":
                 return this.fetchData(Resource.Events);
@@ -224,9 +290,33 @@ export default class WebsocketBackend {
         const queue = this.activeFetches[resource]!;
         delete this.activeFetches[resource];
         queue.forEach((msg) => this.store.dispatch(msg));
+        if (resource === Resource.Flows) {
+            this.previewResetting = false;
+            this.onStoreUpdate();
+        }
+    }
+
+    clearResponseSubscription() {
+        if (this.previewFlow === null) return;
+        this.previewFlow = null;
+        this.previewResponseStart = undefined;
+        const payload = {
+            flow_id: null,
+            subscription: ++this.previewSubscription,
+        };
+        // Invalidate before dispatching so nested store listeners cannot resubscribe.
+        this.store.dispatch(responsePreview.subscribe(payload));
+        if (
+            !this.previewDisconnected &&
+            this.socket.readyState === WebSocket.OPEN
+        ) {
+            this.sendMessage({ type: "flows/subscribeResponse", payload });
+        }
     }
 
     onClose(closeEvent: CloseEvent) {
+        this.previewDisconnected = true;
+        this.clearResponseSubscription();
         this.store.dispatch(
             connectionActions.connectionError(
                 `Connection closed at ${new Date().toUTCString()} with error code ${
@@ -238,6 +328,8 @@ export default class WebsocketBackend {
     }
 
     onError(...args) {
+        this.previewDisconnected = true;
+        this.clearResponseSubscription();
         // FIXME
         console.error("websocket connection errored", args);
     }

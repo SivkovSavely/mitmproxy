@@ -12,6 +12,7 @@ import { LogLevel } from "../../ducks/eventLog";
 import { ReverseProxyProtocols } from "../../backends/consts";
 import { defaultReverseState } from "../../modes/reverse";
 import { FilterName } from "../../ducks/ui/filter";
+import { defaultState as defaultPreview } from "../../ducks/responsePreview";
 
 export { THTTPFlow as TFlow, TTCPFlow, TUDPFlow };
 
@@ -26,6 +27,7 @@ tflow1.id = "flow2";
 tflow1.request.path = "/second";
 
 export const testState: RootState = {
+    responsePreview: defaultPreview,
     backendState: TBackendState(),
     options_meta: {
         anticache: {

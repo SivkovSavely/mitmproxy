@@ -104,6 +104,7 @@ export interface HTTPRequest extends HTTPMessage {
 }
 
 export interface HTTPResponse extends HTTPMessage {
+    stream_preview?: boolean;
     status_code: number;
     reason: string;
 }

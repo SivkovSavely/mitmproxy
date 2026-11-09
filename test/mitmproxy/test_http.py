@@ -20,6 +20,17 @@ from mitmproxy.test.tutils import treq
 from mitmproxy.test.tutils import tresp
 
 
+def test_response_stream_observer_runtime_only():
+    response = Response.make()
+    assert response._stream_observer is None
+    response._stream_observer = lambda chunk: None
+    state = response.get_state()
+    assert "_stream_observer" not in state
+    assert "_stream_observer" not in vars(response.data)
+    assert response.copy()._stream_observer is None
+    assert Response.from_state(state)._stream_observer is None
+
+
 class TestRequest:
     def test_simple(self):
         f = tflow()

@@ -79,6 +79,14 @@ class TestWebAuth:
                 tctx.options.web_json_eager_parse_max_bytes = -1
             assert tctx.options.web_json_eager_parse_max_bytes == 0
 
+    def test_stream_preview_limit(self):
+        with taddons.context(webaddons.WebAddon()) as tctx:
+            assert tctx.options.web_stream_preview_max_bytes == 1048576
+            tctx.options.web_stream_preview_max_bytes = 0
+            with pytest.raises(OptionsError):
+                tctx.options.web_stream_preview_max_bytes = -1
+            assert tctx.options.web_stream_preview_max_bytes == 0
+
     @pytest.mark.parametrize(
         "web_host,web_port,expected_web_url",
         [

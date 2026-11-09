@@ -342,12 +342,20 @@ def test_store_streamed_bodies(tctx, store_streamed_bodies):
     tctx.options.store_streamed_bodies = store_streamed_bodies
     server = Placeholder(Server)
     flow = Placeholder(HTTPFlow)
+    observed = []
+    content_during_observation = []
 
     def enable_streaming(flow: HTTPFlow):
         if flow.response is None:
             flow.request.stream = lambda x: b"[" + x + b"]"
         else:
-            flow.response.stream = lambda x: b"[" + x + b"]"
+            flow.response.stream = lambda x: [b"[", x, b"]"] if x else [b"[]"]
+
+            def observe(chunk):
+                content_during_observation.append(flow.response.data.content)
+                observed.append(chunk)
+
+            flow.response._stream_observer = observe
 
     assert (
         Playbook(http.HttpLayer(tctx, HTTPMode.regular))
@@ -387,7 +395,9 @@ def test_store_streamed_bodies(tctx, store_streamed_bodies):
             tctx.client,
             b"HTTP/1.1 200 OK\r\n"
             b"Transfer-Encoding: chunked\r\n\r\n"
-            b"5\r\n[def]\r\n"
+            b"1\r\n[\r\n"
+            b"3\r\ndef\r\n"
+            b"1\r\n]\r\n"
             b"2\r\n[]\r\n",
         )
         << http.HttpResponseHook(flow)
@@ -400,20 +410,26 @@ def test_store_streamed_bodies(tctx, store_streamed_bodies):
     else:
         assert flow().request.data.content is None
         assert flow().response.data.content is None
+    assert observed == [b"[", b"def", b"]", b"[]"]
+    assert content_during_observation == [None] * 4
 
 
 @pytest.mark.parametrize("why", ["body_size=0", "body_size=3", "addon"])
 @pytest.mark.parametrize("transfer_encoding", ["identity", "chunked"])
-def test_response_streaming(tctx, why, transfer_encoding):
+@pytest.mark.parametrize("observe", [False, True])
+def test_response_streaming(tctx, why, transfer_encoding, observe):
     """Test HTTP response streaming"""
     server = Placeholder(Server)
     flow = Placeholder(HTTPFlow)
     playbook = Playbook(http.HttpLayer(tctx, HTTPMode.regular))
+    observed = []
 
     if why.startswith("body_size"):
         tctx.options.stream_large_bodies = why.replace("body_size=", "")
 
     def enable_streaming(flow: HTTPFlow):
+        if observe:
+            flow.response._stream_observer = observed.append
         if why == "addon":
             flow.response.stream = True
 
@@ -473,6 +489,54 @@ def test_response_streaming(tctx, why, transfer_encoding):
 
     assert playbook
     assert not flow().live
+    if observe:
+        assert observed == (
+            [b"abcdef"]
+            if why == "body_size=3" and transfer_encoding == "chunked"
+            else [b"abc", b"def"]
+        )
+    else:
+        assert observed == []
+
+
+def test_response_stream_observer_failure(tctx):
+    server = Placeholder(Server)
+    flow = Placeholder(HTTPFlow)
+    observed = []
+
+    def enable_streaming(flow):
+        flow.response.stream = True
+
+        def observe(chunk):
+            observed.append(chunk)
+            raise ValueError("observer failure")
+
+        flow.response._stream_observer = observe
+
+    assert (
+        Playbook(http.HttpLayer(tctx, HTTPMode.regular))
+        >> DataReceived(
+            tctx.client,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        << http.HttpRequestHeadersHook(flow)
+        >> reply()
+        << http.HttpRequestHook(flow)
+        >> reply()
+        << OpenConnection(server)
+        >> reply(None)
+        << SendData(server, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        >> DataReceived(server, b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc")
+        << http.HttpResponseHeadersHook(flow)
+        >> reply(side_effect=enable_streaming)
+        << SendData(tctx.client, b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc")
+        >> DataReceived(server, b"def")
+        << SendData(tctx.client, b"def")
+        << http.HttpResponseHook(flow)
+        >> reply()
+    )
+    assert observed == [b"abc"]
+    assert flow().response._stream_observer is None
 
 
 def test_stream_modify(tctx):

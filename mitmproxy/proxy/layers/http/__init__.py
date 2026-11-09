@@ -454,6 +454,7 @@ class HttpStream(layer.Layer):
                 if self.context.options.store_streamed_bodies:
                     self.response_body_buf += chunk
                 yield SendHttp(ResponseData(self.stream_id, chunk), self.context.client)
+                self.flow.response._observe_stream_chunk(chunk)
         elif isinstance(event, ResponseTrailers):
             self.flow.response.trailers = event.trailers
             # will be sent in send_response() after the response hook.
@@ -470,6 +471,7 @@ class HttpStream(layer.Layer):
                     yield SendHttp(
                         ResponseData(self.stream_id, chunk), self.context.client
                     )
+                    self.flow.response._observe_stream_chunk(chunk)
             if self.context.options.store_streamed_bodies:
                 self.flow.response.data.content = bytes(self.response_body_buf)
                 self.response_body_buf.clear()

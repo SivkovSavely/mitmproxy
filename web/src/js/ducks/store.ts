@@ -14,6 +14,7 @@ import backendState from "./backendState";
 import options_meta from "./options_meta";
 import modes from "./modes";
 import processes from "./processes";
+import responsePreview from "./responsePreview";
 
 export const reducer = {
     commandBar,
@@ -27,6 +28,7 @@ export const reducer = {
     backendState,
     processes,
     scripts,
+    responsePreview,
 };
 
 export const middlewares = {

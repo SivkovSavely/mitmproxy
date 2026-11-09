@@ -8,7 +8,10 @@ import type { EventLogItem } from "../../ducks/eventLog";
 import { EVENTS_ADD, EVENTS_RECEIVE, LogLevel } from "../../ducks/eventLog";
 import { OPTIONS_RECEIVE } from "../../ducks/options";
 import { SCRIPTS_RECEIVE, ScriptStatusKind } from "../../ducks/scripts";
-import { FLOWS_RECEIVE } from "../../ducks/flows";
+import { FLOWS_RECEIVE, FLOWS_UPDATE, select } from "../../ducks/flows";
+import { TFlow } from "../ducks/tutils";
+import { selectTab } from "../../ducks/ui/flow";
+import { setCurrent, Tab } from "../../ducks/ui/tabs";
 import { STATE_RECEIVE } from "../../ducks/backendState";
 import { setFilter } from "../../ducks/ui/filter";
 import { TStore } from "../ducks/tutils";
@@ -31,6 +34,287 @@ beforeEach(() => {
 });
 
 describe("websocket backend", () => {
+    test("the unavailable error tab falls back to a response only without a flow error", () => {
+        const store = TStore(null);
+        const backend = new WebSocketBackend(store);
+        const send = jest.spyOn(backend.socket, "send");
+        // @ts-expect-error writable mock
+        backend.socket.readyState = WebSocket.OPEN;
+        const flow = TFlow();
+        Object.assign(flow.response, { stream_preview: true });
+        store.dispatch(selectTab("error"));
+        store.dispatch(select([flow]));
+        expect(send).not.toHaveBeenCalled();
+        const noError = { ...flow, error: undefined };
+        store.dispatch(FLOWS_UPDATE({ flow: noError, matching_filters: {} }));
+        expect(send).toHaveBeenLastCalledWith(
+            JSON.stringify({
+                type: "flows/subscribeResponse",
+                payload: { flow_id: flow.id, subscription: 1 },
+            }),
+        );
+        store.dispatch(FLOWS_UPDATE({ flow, matching_filters: {} }));
+        expect(send).toHaveBeenLastCalledWith(
+            JSON.stringify({
+                type: "flows/subscribeResponse",
+                payload: { flow_id: null, subscription: 2 },
+            }),
+        );
+    });
+
+    test("same-id response generations rotate subscriptions without restarting terminal sessions", () => {
+        const store = TStore(null);
+        const backend = new WebSocketBackend(store);
+        const send = jest.spyOn(backend.socket, "send");
+        // @ts-expect-error writable mock
+        backend.socket.readyState = WebSocket.OPEN;
+        const flow = TFlow();
+        Object.assign(flow.response, { stream_preview: true });
+        store.dispatch(selectTab("response"));
+        store.dispatch(select([flow]));
+        const preview = {
+            flow_id: flow.id,
+            subscription: 1,
+            seq: 1,
+            start: 0,
+            end: 3,
+            received: 3,
+            dropped: 0,
+            missing: false,
+            status: "finished",
+            reason: null,
+            text: "old",
+            reset: true,
+            stored: false,
+            max_bytes: 32,
+        };
+        backend.onMessage({ type: "response/preview", payload: preview });
+        const completed = {
+            ...flow,
+            response: { ...flow.response, stream_preview: false },
+        };
+        store.dispatch(FLOWS_UPDATE({ flow: completed, matching_filters: {} }));
+        expect(send).toHaveBeenCalledTimes(1);
+        const next = {
+            ...flow,
+            response: {
+                ...flow.response,
+                timestamp_start: flow.response.timestamp_start + 1,
+            },
+        };
+        store.dispatch(FLOWS_UPDATE({ flow: next, matching_filters: {} }));
+        expect(send).toHaveBeenLastCalledWith(
+            JSON.stringify({
+                type: "flows/subscribeResponse",
+                payload: { flow_id: flow.id, subscription: 2 },
+            }),
+        );
+        expect(store.getState().responsePreview.chunks).toEqual([]);
+        backend.onMessage({
+            type: "response/preview",
+            payload: { ...preview, seq: 99 },
+        });
+        expect(store.getState().responsePreview.preview).toBeNull();
+    });
+
+    test("selection changes invalidate stale previews and tab changes unsubscribe", () => {
+        const store = TStore(null);
+        const backend = new WebSocketBackend(store);
+        const send = jest.spyOn(backend.socket, "send");
+        // @ts-expect-error writable mock
+        backend.socket.readyState = WebSocket.OPEN;
+        const flow = TFlow();
+        Object.assign(flow.response, {
+            stream_preview: true,
+            timestamp_end: null,
+        });
+        const other = { ...flow, id: "other" };
+        store.dispatch(selectTab("response"));
+        store.dispatch(select([flow]));
+        const preview = {
+            flow_id: flow.id,
+            subscription: 1,
+            seq: 1,
+            start: 0,
+            end: 9,
+            received: 9,
+            dropped: 0,
+            missing: false,
+            status: "streaming",
+            reason: null,
+            text: "data: a\n\n",
+            reset: true,
+            stored: false,
+            max_bytes: 32,
+        };
+        backend.onMessage({ type: "response/preview", payload: preview });
+        expect(store.getState().responsePreview.chunks[0].text).toBe(
+            "data: a\n\n",
+        );
+        expect(flow.response.contentLength).not.toBe(9);
+        store.dispatch(select([other]));
+        expect(send).toHaveBeenLastCalledWith(
+            JSON.stringify({
+                type: "flows/subscribeResponse",
+                payload: { flow_id: "other", subscription: 2 },
+            }),
+        );
+        backend.onMessage({
+            type: "response/preview",
+            payload: { ...preview, seq: 99 },
+        });
+        expect(store.getState().responsePreview.chunks).toEqual([]);
+        backend.onMessage({
+            type: "response/preview",
+            payload: {
+                ...preview,
+                flow_id: "other",
+                subscription: 2,
+                text: "new",
+            },
+        });
+        backend.onMessage({
+            type: "response/preview",
+            payload: {
+                ...preview,
+                flow_id: "other",
+                subscription: 2,
+                text: "duplicate",
+            },
+        });
+        expect(store.getState().responsePreview.chunks[0].text).toBe("new");
+        store.dispatch(selectTab("request"));
+        expect(send).toHaveBeenLastCalledWith(
+            JSON.stringify({
+                type: "flows/subscribeResponse",
+                payload: { flow_id: null, subscription: 3 },
+            }),
+        );
+        expect(store.getState().responsePreview.preview).toBeNull();
+    });
+
+    test("eligibility uses stream_preview, visible workspace and exactly one selected response", () => {
+        const store = TStore(null);
+        const backend = new WebSocketBackend(store);
+        const send = jest.spyOn(backend.socket, "send");
+        // @ts-expect-error writable mock
+        backend.socket.readyState = WebSocket.OPEN;
+        const flow = TFlow();
+        Object.assign(flow.response, { stream: true, timestamp_end: null });
+        store.dispatch(selectTab("response"));
+        store.dispatch(select([flow]));
+        expect(send).not.toHaveBeenCalled();
+        const watched = {
+            ...flow,
+            response: { ...flow.response, stream_preview: true },
+        };
+        store.dispatch(setCurrent(Tab.Capture));
+        store.dispatch(select([watched]));
+        store.dispatch(setCurrent(Tab.Scripts));
+        expect(send).not.toHaveBeenCalled();
+        store.dispatch(select([watched, { ...watched, id: "other" }]));
+        store.dispatch(setCurrent(Tab.FlowList));
+        expect(send).not.toHaveBeenCalled();
+        store.dispatch(select([watched]));
+        expect(send).toHaveBeenCalledTimes(1);
+        store.dispatch(select([]));
+        expect(send).toHaveBeenCalledTimes(2);
+        expect(store.getState().responsePreview.flow_id).toBeNull();
+    });
+
+    test("reset invalidates the session and resubscribes with a fresh token after fetching", async () => {
+        const store = TStore(null);
+        const backend = new WebSocketBackend(store);
+        const send = jest.spyOn(backend.socket, "send");
+        // @ts-expect-error writable mock
+        backend.socket.readyState = WebSocket.OPEN;
+        const flow = TFlow();
+        Object.assign(flow.response, { stream_preview: true });
+        store.dispatch(selectTab("response"));
+        store.dispatch(select([flow]));
+        fetchMock.mockResponseOnce(JSON.stringify([flow]));
+        const fetched = backend.onMessage({ type: "flows/reset" });
+        expect(store.getState().responsePreview.flow_id).toBeNull();
+        expect(send).toHaveBeenLastCalledWith(
+            JSON.stringify({
+                type: "flows/subscribeResponse",
+                payload: { flow_id: null, subscription: 2 },
+            }),
+        );
+        await fetched;
+        expect(send).toHaveBeenLastCalledWith(
+            JSON.stringify({
+                type: "flows/subscribeResponse",
+                payload: { flow_id: flow.id, subscription: 3 },
+            }),
+        );
+    });
+
+    test("connecting and disconnected sockets never queue response subscriptions", () => {
+        const store = TStore(null);
+        const backend = new WebSocketBackend(store);
+        const send = jest.spyOn(backend.socket, "send");
+        const flow = TFlow();
+        Object.assign(flow.response, { stream_preview: true });
+        store.dispatch(selectTab("response"));
+        store.dispatch(select([flow]));
+        expect(backend.messageQueue).toEqual([]);
+        // @ts-expect-error writable mock
+        backend.socket.readyState = WebSocket.OPEN;
+        backend.onStoreUpdate();
+        expect(send).toHaveBeenCalledTimes(1);
+        jest.spyOn(console, "error").mockImplementation(() => {});
+        backend.onClose(new CloseEvent("close"));
+        expect(store.getState().responsePreview.flow_id).toBeNull();
+        store.dispatch(selectTab("request"));
+        store.dispatch(selectTab("response"));
+        expect(send).toHaveBeenCalledTimes(1);
+        expect(backend.messageQueue).toEqual([]);
+    });
+
+    test("only the visible selected response subscribes, and completion keeps the session", () => {
+        const store = TStore(null);
+        const backend = new WebSocketBackend(store);
+        const send = jest.spyOn(backend.socket, "send");
+        // @ts-expect-error writable mock
+        backend.socket.readyState = WebSocket.OPEN;
+        store.dispatch(connectionActions.finishFetching());
+        const flow = TFlow();
+        Object.assign(flow.response, {
+            stream_preview: true,
+            timestamp_end: null,
+        });
+        store.dispatch(FLOWS_RECEIVE([flow]));
+        store.dispatch(select([flow]));
+        expect(send).not.toHaveBeenCalled();
+        store.dispatch(selectTab("response"));
+        expect(send).toHaveBeenLastCalledWith(
+            JSON.stringify({
+                type: "flows/subscribeResponse",
+                payload: { flow_id: flow.id, subscription: 1 },
+            }),
+        );
+        const completed = {
+            ...flow,
+            response: {
+                ...flow.response,
+                stream_preview: false,
+                timestamp_end: 100,
+            },
+        };
+        store.dispatch(FLOWS_UPDATE({ flow: completed, matching_filters: {} }));
+        expect(send).toHaveBeenCalledTimes(1);
+        store.dispatch(setCurrent(Tab.Scripts));
+        expect(send).toHaveBeenLastCalledWith(
+            JSON.stringify({
+                type: "flows/subscribeResponse",
+                payload: { flow_id: null, subscription: 2 },
+            }),
+        );
+        store.dispatch(setCurrent(Tab.FlowList));
+        expect(send).toHaveBeenCalledTimes(2);
+    });
+
     test("message queueing", async () => {
         let resolve;
         const events: Promise<MockResponseInit> = new Promise((r) => {
@@ -92,6 +376,7 @@ describe("websocket backend", () => {
 
         const actions: Array<UnknownAction> = [];
         const backend = new WebSocketBackend({
+            getState: TStore(null).getState,
             dispatch: (e) => actions.push(e),
             subscribe: () => {},
         });
@@ -149,6 +434,7 @@ describe("websocket backend", () => {
         fetchMock.mockOnceIf("./events", "[]");
         // Not useful, only for coverage
         const backend = new WebSocketBackend({
+            getState: TStore(null).getState,
             dispatch: () => {},
             subscribe: () => {},
         });

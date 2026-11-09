@@ -1,3 +1,4 @@
+import asyncio
 import gzip
 import importlib
 import io
@@ -25,6 +26,38 @@ from mitmproxy.tools.web import app
 from mitmproxy.tools.web import master as webmaster
 
 here = Path(__file__).parent.absolute()
+
+
+async def test_slow_preview_sender():
+    conn = app.ClientConnection.__new__(app.ClientConnection)
+    conn._send_queue = asyncio.Queue()
+    conn._preview_pending = None
+    conn._preview_queued = False
+    blocked = asyncio.Event()
+    sent = []
+
+    async def write(message):
+        sent.append(json.loads(message))
+        await blocked.wait()
+
+    conn.write_message = write
+    conn.queue_preview(lambda: {"seq": 1})
+    task = asyncio.create_task(conn.send_task())
+    await asyncio.sleep(0)
+    assert sent == [{"type": "response/preview", "payload": {"seq": 1}}]
+    for seq in range(2, 1002):
+        conn.queue_preview(lambda seq=seq: {"seq": seq})
+    assert conn._send_queue.qsize() == 1
+    blocked.set()
+    await asyncio.sleep(0)
+    assert sent[-1] == {"type": "response/preview", "payload": {"seq": 1001}}
+    conn.queue_preview(lambda: {"seq": 1002})
+    conn.clear_preview()
+    await asyncio.sleep(0)
+    assert len(sent) == 2
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.fixture(scope="module")
@@ -655,7 +688,7 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
             resp = self.fetch(
                 "/scripts/source?path=" + urllib.parse.quote(script_path),
                 method="PUT",
-                body='def load(l):\n    pass\n',
+                body="def load(l):\n    pass\n",
             )
             assert resp.code == 200
             assert get_json(resp) == {"path": script_path}
@@ -820,6 +853,134 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
             self.assertIsNone(response)
             self.assertEqual(ws_client.close_code, 1011)
             self.assertEqual(ws_client.close_reason, "Internal server error.")
+
+    @tornado.testing.gen_test
+    async def test_response_preview_subscription(self):
+        request = httpclient.HTTPRequest(
+            f"ws://localhost:{self.get_http_port()}/updates",
+            headers={"Cookie": self.auth_cookie},
+        )
+        watched = await websocket.websocket_connect(request)
+        other = await websocket.websocket_connect(request)
+        flow = self.view.get_by_id("42")
+        flow.response.raw_content = None
+        flow.response.timestamp_end = None
+        flow.response.headers["content-type"] = "text/event-stream"
+        flow.response.stream = True
+        self.master.stream_preview.responseheaders(flow)
+        for client in (watched, other):
+            update = json.loads(await client.read_message())
+            assert update["type"] == "flows/update"
+            response = update["payload"]["flow"]["response"]
+            assert response["timestamp_end"] is None
+            assert response["contentHash"] is None
+            assert response["stream_preview"]
+
+        await watched.write_message(
+            json.dumps(
+                {
+                    "type": "flows/subscribeResponse",
+                    "payload": {"flow_id": "42", "subscription": 7},
+                }
+            )
+        )
+        ack = json.loads(await watched.read_message())
+        assert ack["type"] == "response/preview"
+        assert ack["payload"]["subscription"] == 7
+        assert ack["payload"]["status"] == "waiting"
+        flow.response._observe_stream_chunk(b"data: one\n\n")
+        delta = json.loads(await watched.read_message())["payload"]
+        assert delta["text"] == "data: one\n\n"
+        assert delta["received"] == 11 and delta["seq"] == 2
+        flow.response._observe_stream_chunk(b"data: two\n\n")
+        self.master.stream_preview.response(flow)
+        self.view.response(flow)
+        final = json.loads(await watched.read_message())["payload"]
+        assert final["status"] == "finished" and not final["stored"]
+        assert final["text"] == "data: two\n\n"
+        assert json.loads(await watched.read_message())["type"] == "flows/update"
+        # An unsubscribed connection receives lifecycle metadata, never body text.
+        assert json.loads(await other.read_message())["type"] == "flows/update"
+        assert not self.master.stream_preview.active
+        assert not self.master.stream_preview.clients
+        watched.close()
+        other.close()
+
+    @tornado.testing.gen_test
+    async def test_response_preview_unsubscribe_and_disconnect(self):
+        request = httpclient.HTTPRequest(
+            f"ws://localhost:{self.get_http_port()}/updates",
+            headers={"Cookie": self.auth_cookie},
+        )
+        flow = self.view.get_by_id("42")
+        self.master.stream_preview.responseheaders(flow)
+        client = await websocket.websocket_connect(request)
+        for flow_id, token in [("42", 1), (None, 2), ("42", 3)]:
+            await client.write_message(
+                json.dumps(
+                    {
+                        "type": "flows/subscribeResponse",
+                        "payload": {"flow_id": flow_id, "subscription": token},
+                    }
+                )
+            )
+            if flow_id:
+                assert (
+                    json.loads(await client.read_message())["payload"]["subscription"]
+                    == token
+                )
+        assert len(self.master.stream_preview.clients) == 1
+        client.close()
+        for _ in range(20):
+            if not self.master.stream_preview.clients:
+                break
+            await asyncio.sleep(0.01)
+        assert not self.master.stream_preview.clients
+
+    @tornado.testing.gen_test
+    async def test_response_preview_invalid_subscription(self):
+        for flow_id in (42, True):
+            request = httpclient.HTTPRequest(
+                f"ws://localhost:{self.get_http_port()}/updates",
+                headers={"Cookie": self.auth_cookie},
+            )
+            client = await websocket.websocket_connect(request)
+            await client.write_message(
+                json.dumps(
+                    {
+                        "type": "flows/subscribeResponse",
+                        "payload": {"flow_id": flow_id, "subscription": 1},
+                    }
+                )
+            )
+            assert await client.read_message() is None
+            assert client.close_code == 1011
+
+    @tornado.testing.gen_test
+    async def test_removed_preview_subscription_preserves_socket(self):
+        request = httpclient.HTTPRequest(
+            f"ws://localhost:{self.get_http_port()}/updates",
+            headers={"Cookie": self.auth_cookie},
+        )
+        client = await websocket.websocket_connect(request)
+        self.view.remove([self.view.get_by_id("42")])
+        assert json.loads(await client.read_message())["type"] == "flows/remove"
+        await client.write_message(
+            json.dumps(
+                {
+                    "type": "flows/subscribeResponse",
+                    "payload": {"flow_id": "42", "subscription": 1},
+                }
+            )
+        )
+        rejection = json.loads(await client.read_message())
+        assert rejection["type"] == "response/preview"
+        assert rejection["payload"]["status"] == "aborted"
+        assert rejection["payload"]["reason"] == "Unknown HTTP response"
+        self.view.update([self.view.get_by_id("43")])
+        assert json.loads(await client.read_message())["type"] == "flows/update"
+        assert client.close_code is None
+        client.close()
 
     def test_process_list(self):
         try:

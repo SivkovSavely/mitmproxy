@@ -20,6 +20,7 @@ import {
     JSON_WORD_WRAP_STORAGE_KEY,
 } from "../helpers/usePersistentBooleanPreference";
 import { copyViewContentDataToClipboard, fetchApi } from "../../utils";
+import LiveResponse from "./LiveResponse";
 
 type HttpMessageProps = {
     flow: HTTPFlow;
@@ -28,6 +29,18 @@ type HttpMessageProps = {
 
 export default function HttpMessage({ flow, message }: HttpMessageProps) {
     const [isEdited, setIsEdited] = useState<boolean>(false);
+    const preview = useAppSelector((state) => state.responsePreview);
+    const canonicalBodyReady =
+        flow.response?.stream_preview !== true &&
+        message.timestamp_end != null &&
+        (message.contentHash != null || message.contentLength != null);
+    if (
+        message === flow.response &&
+        preview.flow_id === flow.id &&
+        (preview.preview?.status === "aborted" || !canonicalBodyReady)
+    ) {
+        return <LiveResponse key={preview.subscription} state={preview} />;
+    }
     if (isEdited) {
         return (
             <HttpMessageEdit

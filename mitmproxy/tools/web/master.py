@@ -20,6 +20,7 @@ from mitmproxy.addons import view
 from mitmproxy.addons.proxyserver import Proxyserver
 from mitmproxy.tools.web import app
 from mitmproxy.tools.web import static_viewer
+from mitmproxy.tools.web import stream_preview
 from mitmproxy.tools.web import webaddons
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,9 @@ class WebMaster(master.Master):
         self.events.sig_refresh.connect(self._sig_events_refresh)
 
         self.options.changed.connect(self._sig_options_update)
+        self.stream_preview = stream_preview.StreamPreviewManager(
+            self.view, self.options
+        )
 
         self.addons.add(*addons.default_addons())
         self.addons.add(
@@ -48,6 +52,7 @@ class WebMaster(master.Master):
             intercept.Intercept(),
             readfile.ReadFileStdin(),
             static_viewer.StaticViewer(),
+            self.stream_preview,
             self.view,
             self.events,
             errorcheck.ErrorCheck(),
