@@ -11,6 +11,95 @@ exports[`MainMenu 1`] = `
       <div
         class="menu-content"
       >
+        <details
+          class="time-range-selector"
+        >
+          <summary
+            class="btn btn-default btn-sm"
+          >
+            Time range: Last 30 minutes
+          </summary>
+          <div
+            class="popover"
+          >
+            <div
+              class="popover-content"
+            >
+              <fieldset
+                disabled=""
+              >
+                <label>
+                  Range mode
+                  <select
+                    class="input"
+                  >
+                    <option
+                      value="relative"
+                    >
+                      Relative
+                    </option>
+                    <option
+                      value="explicit"
+                    >
+                      Explicit dates
+                    </option>
+                  </select>
+                </label>
+                <label>
+                  Relative period
+                  <select
+                    class="input"
+                  >
+                    <option
+                      value="300"
+                    >
+                      5 minutes
+                    </option>
+                    <option
+                      value="900"
+                    >
+                      15 minutes
+                    </option>
+                    <option
+                      value="1800"
+                    >
+                      30 minutes
+                    </option>
+                    <option
+                      value="3600"
+                    >
+                      1 hour
+                    </option>
+                    <option
+                      value="21600"
+                    >
+                      6 hours
+                    </option>
+                    <option
+                      value="86400"
+                    >
+                      24 hours
+                    </option>
+                    <option
+                      value="604800"
+                    >
+                      7 days
+                    </option>
+                  </select>
+                </label>
+                <button
+                  class="btn btn-default btn-sm"
+                  type="button"
+                >
+                  Apply
+                </button>
+              </fieldset>
+              <p>
+                Waiting for backend state...
+              </p>
+            </div>
+          </div>
+        </details>
         <div
           class="filter-input input-group"
         >

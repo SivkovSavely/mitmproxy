@@ -4,50 +4,75 @@ import * as modalActions from "./modal";
 import { tabsForFlow } from "../../components/FlowView";
 import { runCommand } from "../../utils";
 import type { AppDispatch, RootState } from "../store";
+import { selectTimeRangeFlows } from "../timeRange";
+import { buildIndex } from "../flows/_utils";
+import { clearSelectedSummary } from "../history";
 
 export function onKeyDown(e: KeyboardEvent) {
-    //console.debug("onKeyDown", e)
-    if (e.ctrlKey || e.metaKey) {
+    const target = e.target instanceof HTMLElement ? e.target : null;
+    if (
+        e.ctrlKey ||
+        e.metaKey ||
+        e.defaultPrevented ||
+        target?.closest(
+            'input, select, textarea, [contenteditable]:not([contenteditable="false"])',
+        ) ||
+        (["Enter", " ", "Tab"].includes(e.key) &&
+            target?.closest("button, a[href], summary"))
+    ) {
         return () => {};
     }
     const key = e.key;
     e.preventDefault();
     return (dispatch: AppDispatch, getState: () => RootState) => {
-        const { flows } = getState();
+        const state = getState();
+        const { flows } = state;
         const selectedFlows = flows.selected;
         const flow = selectedFlows[0];
+        const navigate = (shift: number) => {
+            if (state.backendState.sqlite_history) return;
+            const view = selectTimeRangeFlows(state);
+            dispatch(
+                flowsActions.selectRelative(
+                    { ...flows, view, _viewIndex: buildIndex(view) },
+                    shift,
+                ),
+            );
+        };
 
         switch (key) {
             case "k":
             case "ArrowUp":
-                dispatch(flowsActions.selectRelative(flows, -1));
+                navigate(-1);
                 break;
 
             case "j":
             case "ArrowDown":
-                dispatch(flowsActions.selectRelative(flows, +1));
+                navigate(+1);
                 break;
 
             case " ":
             case "PageDown":
-                dispatch(flowsActions.selectRelative(flows, +10));
+                navigate(+10);
                 break;
 
             case "PageUp":
-                dispatch(flowsActions.selectRelative(flows, -10));
+                navigate(-10);
                 break;
 
             case "End":
-                dispatch(flowsActions.selectRelative(flows, +1e10));
+                navigate(+1e10);
                 break;
 
             case "Home":
-                dispatch(flowsActions.selectRelative(flows, -1e10));
+                navigate(-1e10);
                 break;
 
             case "Escape":
                 if (getState().ui.modal.activeModal) {
                     dispatch(modalActions.hideModal());
+                } else if (state.backendState.sqlite_history) {
+                    dispatch(clearSelectedSummary());
                 } else {
                     dispatch(flowsActions.select([]));
                 }

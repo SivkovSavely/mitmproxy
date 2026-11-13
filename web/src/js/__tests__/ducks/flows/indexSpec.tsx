@@ -5,6 +5,11 @@ import FlowColumns from "../../../components/FlowTable/FlowColumns";
 import { FilterName } from "../../../ducks/ui/filter";
 import { OPTIONS_RECEIVE, OPTIONS_UPDATE } from "../../../ducks/options";
 import type { OptionsStateWithMeta } from "../../../ducks/options";
+import {
+    applyDraft,
+    establishBackend,
+    updateDraft,
+} from "../../../ducks/timeRange";
 
 describe("flow reducer", () => {
     let s;
@@ -141,6 +146,70 @@ describe("flow reducer", () => {
             );
             store.dispatch(flowActions.selectRange(tflow1));
             expect(store.getState().flows.selected).toEqual([tflow1]);
+        });
+
+        describe("range selections within the global time range", () => {
+            const makeRangeStore = () => {
+                const store = TStore(null);
+                const flows = [
+                    1767225600, 0, 1767225600.25, 1767225600.5, 1767225601,
+                    1767225602,
+                ].map((timestamp_created, index) => ({
+                    ...TFlow(),
+                    id: String(index),
+                    timestamp_created,
+                }));
+                store.dispatch(flowActions.FLOWS_RECEIVE(flows));
+                store.dispatch(
+                    flowActions.FLOWS_FILTER_UPDATE({
+                        name: FilterName.Search,
+                        matching_flow_ids: ["0", "1", "2", "4", "5"],
+                    }),
+                );
+                store.dispatch(establishBackend("range-selection-test"));
+                store.dispatch(
+                    updateDraft({
+                        mode: "explicit",
+                        from: "2026-01-01 00:00:00",
+                        until: "2026-01-01 00:00:01",
+                    }),
+                );
+                store.dispatch(applyDraft());
+                return { store, flows };
+            };
+
+            beforeEach(() => localStorage.clear());
+
+            it("excludes hidden rows in both directions and preserves the selection anchor", () => {
+                const { store, flows } = makeRangeStore();
+                store.dispatch(flowActions.select([flows[0]]));
+                store.dispatch(flowActions.selectRange(flows[4]));
+                expect(
+                    store.getState().flows.selected.map((flow) => flow.id),
+                ).toEqual(["2", "4", "0"]);
+
+                store.dispatch(flowActions.select([flows[4]]));
+                store.dispatch(flowActions.selectRange(flows[0]));
+                expect(
+                    store.getState().flows.selected.map((flow) => flow.id),
+                ).toEqual(["0", "2", "4"]);
+                expect(store.getState().flows.list).toHaveLength(6);
+                expect(store.getState().flows.view).toHaveLength(5);
+            });
+
+            it("starts a new range when the previous anchor is hidden", () => {
+                const { store, flows } = makeRangeStore();
+                store.dispatch(flowActions.select([flows[1]]));
+                store.dispatch(flowActions.selectRange(flows[4]));
+                expect(store.getState().flows.selected).toEqual([flows[4]]);
+            });
+
+            it("does not select a target hidden by the time range", () => {
+                const { store, flows } = makeRangeStore();
+                store.dispatch(flowActions.select([flows[0]]));
+                store.dispatch(flowActions.selectRange(flows[1]));
+                expect(store.getState().flows.selected).toEqual([]);
+            });
         });
 
         it("should select next row on remove", () => {

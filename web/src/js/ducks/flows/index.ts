@@ -17,6 +17,7 @@ import {
 } from "./_utils";
 import { toSorted, toSpliced } from "./_compat";
 import { OPTIONS_RECEIVE, OPTIONS_UPDATE } from "../options";
+import { selectTimeRangeFlows } from "../timeRange";
 
 export * from "./_backend_actions";
 
@@ -419,19 +420,25 @@ export function selectToggle(flow: Flow) {
 /** Select a range of flows with shift + click. */
 export function selectRange(flow: Flow) {
     return (dispatch: AppDispatch, getState: () => RootState) => {
-        const { flows } = getState();
+        const state = getState();
+        const { flows } = state;
+        const view = selectTimeRangeFlows(state);
+        const viewIndex = buildIndex(view);
         const prev = flows.selected[flows.selected.length - 1];
 
-        const thisIndex = flows._viewIndex.get(flow.id);
-        const prevIndex = flows._viewIndex.get(prev?.id);
-        if (thisIndex === undefined || prevIndex === undefined) {
+        const thisIndex = viewIndex.get(flow.id);
+        const prevIndex = viewIndex.get(prev?.id);
+        if (thisIndex === undefined) {
+            return dispatch(select([]));
+        }
+        if (prevIndex === undefined) {
             return dispatch(select([flow]));
         }
         let newSelection: Flow[];
         if (thisIndex <= prevIndex) {
-            newSelection = flows.view.slice(thisIndex, prevIndex + 1);
+            newSelection = view.slice(thisIndex, prevIndex + 1);
         } else {
-            newSelection = flows.view.slice(prevIndex + 1, thisIndex + 1);
+            newSelection = view.slice(prevIndex + 1, thisIndex + 1);
             newSelection.push(prev); // Keep this at the end if the user shift-clicks again.
         }
         return dispatch(select(newSelection));

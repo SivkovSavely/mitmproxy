@@ -182,6 +182,24 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
         assert get_json(resp)[0]["request"]["contentHash"]
         assert get_json(resp)[2]["error"]
 
+    def test_flow_detail_is_live_only(self):
+        resp = self.fetch("/flows/42")
+        assert resp.code == 200
+        assert get_json(resp)["id"] == "42"
+        assert get_json(resp)["request"]["contentLength"] == 7
+        assert self.fetch("/flows/deadbeef").code == 404
+        assert self.fetch("/flows/42", headers={"Cookie": ""}).code == 403
+
+    def test_history_disabled_and_auth(self):
+        state = get_json(self.fetch("/state"))
+        assert state["sqlite_history"] is False
+        for path in ("/flow-history", "/flow-history/count"):
+            assert self.fetch(path, headers={"Cookie": ""}).code == 403
+            assert self.fetch(path).code == 409
+            assert self.fetch(path + "?instance_id=old").code == 409
+            assert self.fetch(path + "?instance_id=" + state["instance_id"]).code == 409
+            assert self.fetch(path, method="POST", body="").code == 405
+
     def test_flows_dump(self):
         resp = self.fetch("/flows/dump")
         assert b"address" in resp.body

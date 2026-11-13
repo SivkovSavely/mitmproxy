@@ -7,6 +7,7 @@ export function TBackendState(): Required<BackendStateExtra> {
             "auto",
             "Raw"
         ],
+        "instance_id": "test-backend-instance",
         "localModeUnavailable": null,
         "platform": "darwin",
         "servers": {
@@ -53,6 +54,7 @@ export function TBackendState(): Required<BackendStateExtra> {
                 "type": "tun"
             }
         },
+        "sqlite_history": false,
         "version": "1.2.3"
     }
 }

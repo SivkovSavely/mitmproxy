@@ -2,6 +2,7 @@ import * as React from "react";
 import { formatSize } from "../utils";
 import HideInStatic from "../components/common/HideInStatic";
 import { useAppSelector } from "../ducks";
+import { selectTimeRangeFlows } from "../ducks/timeRange";
 
 export default function Footer() {
     const version = useAppSelector((state) => state.backendState.version);
@@ -24,10 +25,15 @@ export default function Footer() {
         ssl_insecure,
     } = useAppSelector((state) => state.options);
 
-    const selectedFlowsLength = useAppSelector(
-        (state) => state.flows.selected.length,
+    const sqliteHistory = useAppSelector(
+        (state) => state.backendState.sqlite_history,
     );
-    const totalFlowsLength = useAppSelector((state) => state.flows.list.length);
+    const flows = useAppSelector(selectTimeRangeFlows);
+    const selectedIds = useAppSelector((state) => state.flows.selectedIds);
+    const selectedFlowsLength = flows.filter((flow) =>
+        selectedIds.has(flow.id),
+    ).length;
+    const totalFlowsLength = flows.length;
 
     return (
         <footer>
@@ -70,7 +76,7 @@ export default function Footer() {
                     stream: {formatSize(stream_large_bodies)}
                 </span>
             )}
-            {totalFlowsLength > 0 && (
+            {!sqliteHistory && totalFlowsLength > 0 && (
                 <span className="label label-default">
                     {selectedFlowsLength} of {totalFlowsLength} flows selected
                 </span>

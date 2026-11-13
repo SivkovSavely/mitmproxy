@@ -9,6 +9,7 @@ import Modal from "./Modal/Modal";
 import ThemeManager from "./helpers/ThemeManager";
 import type { RootState } from "../ducks";
 import { connect } from "react-redux";
+import { TimeRangeRefresh } from "./Header/TimeRangeSelector";
 
 type ProxyAppMainProps = {
     showEventLog: boolean;
@@ -59,6 +60,7 @@ class ProxyAppMain extends Component<ProxyAppMainProps, ProxyAppMainState> {
         return (
             <div id="container" tabIndex={0}>
                 <ThemeManager />
+                <TimeRangeRefresh />
                 <Header />
                 <MainView />
                 {showCommandBar && <CommandBar key="commandbar" />}

@@ -1,5 +1,6 @@
 import errno
 import logging
+import secrets
 from typing import cast
 
 import tornado.httpserver
@@ -19,6 +20,7 @@ from mitmproxy.addons import script
 from mitmproxy.addons import view
 from mitmproxy.addons.proxyserver import Proxyserver
 from mitmproxy.tools.web import app
+from mitmproxy.tools.web import history
 from mitmproxy.tools.web import static_viewer
 from mitmproxy.tools.web import stream_preview
 from mitmproxy.tools.web import webaddons
@@ -29,7 +31,14 @@ logger = logging.getLogger(__name__)
 class WebMaster(master.Master):
     def __init__(self, opts: options.Options, with_termlog: bool = True):
         super().__init__(opts, with_termlog=with_termlog)
+        self.instance_id = secrets.token_hex(32)
+        self.history = history.HistoryReader()
         self.view = view.View()
+        self.view.sig_view_add.connect(self.history.sizes.changed)
+        self.view.sig_view_update.connect(self.history.sizes.changed)
+        self.view.sig_view_remove.connect(self.history.sizes.changed)
+        self.view.sig_store_remove.connect(self.history.sizes.remove)
+        self.view.sig_store_refresh.connect(self.history.sizes.clear)
         self.view.sig_view_add.connect(self._sig_view_add)
         self.view.sig_view_remove.connect(self._sig_view_remove)
         self.view.sig_view_update.connect(self._sig_view_update)
@@ -46,6 +55,7 @@ class WebMaster(master.Master):
 
         self.addons.add(*addons.default_addons())
         self.addons.add(
+            self.history,
             webaddons.WebAddon(),
             webaddons.WebAuth(),
             webaddons.WebScripts(),
@@ -88,6 +98,8 @@ class WebMaster(master.Master):
         )
 
     def _sig_options_update(self, updated: set[str]) -> None:
+        if "save_sqlite_file" in updated:
+            self.history.generation += 1
         options_dict = optmanager.dump_dicts(self.options, updated)
         app.ClientConnection.broadcast(
             type="options/update",

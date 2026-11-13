@@ -13,6 +13,7 @@ import { ReverseProxyProtocols } from "../../backends/consts";
 import { defaultReverseState } from "../../modes/reverse";
 import { FilterName } from "../../ducks/ui/filter";
 import { defaultState as defaultPreview } from "../../ducks/responsePreview";
+import { defaultState as defaultTimeRange } from "../../ducks/timeRange";
 
 export { THTTPFlow as TFlow, TTCPFlow, TUDPFlow };
 
@@ -27,6 +28,8 @@ tflow1.id = "flow2";
 tflow1.request.path = "/second";
 
 export const testState: RootState = {
+    timeRange: defaultTimeRange,
+    history: { selected: null, generation: 0 },
     responsePreview: defaultPreview,
     backendState: TBackendState(),
     options_meta: {

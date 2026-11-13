@@ -20,6 +20,8 @@ export interface ServerInfo {
 }
 
 export interface BackendState {
+    instance_id: string;
+    sqlite_history: boolean;
     version: string;
     contentViews: string[];
     servers: { [key: string]: ServerInfo };
@@ -32,6 +34,8 @@ export interface BackendStateExtra extends BackendState {
 
 export const defaultState: BackendStateExtra = {
     available: false,
+    instance_id: "",
+    sqlite_history: false,
     version: "",
     contentViews: [],
     servers: {},

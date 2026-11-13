@@ -21,6 +21,7 @@ import classnames from "classnames";
 import TcpMessages from "./FlowView/TcpMessages";
 import UdpMessages from "./FlowView/UdpMessages";
 import * as flowsActions from "../ducks/flows";
+import { clearSelectedSummary } from "../ducks/history";
 import Icon from "./common/Icon";
 
 type TabId =
@@ -119,6 +120,9 @@ export function tabsForFlow(flow: Flow): TabId[] {
 export default function FlowView() {
     const dispatch = useAppDispatch();
     const flow = useAppSelector((state) => state.flows.selected[0]);
+    const sqliteHistory = useAppSelector(
+        (state) => state.backendState.sqlite_history,
+    );
     let active = useAppSelector((state) => state.ui.flow.tab) as TabId;
 
     if (flow == undefined) {
@@ -146,7 +150,10 @@ export default function FlowView() {
                 <button
                     data-testid="close-button-id"
                     className="close-button"
-                    onClick={() => dispatch(flowsActions.select([]))}
+                    onClick={() => {
+                        if (sqliteHistory) dispatch(clearSelectedSummary());
+                        else dispatch(flowsActions.select([]));
+                    }}
                 >
                     <Icon name="closeCircle" />
                 </button>

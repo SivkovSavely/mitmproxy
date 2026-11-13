@@ -77,6 +77,10 @@ _SCHEMA = """CREATE TABLE flows (
     payload BLOB NOT NULL
 )"""
 _COLUMNS = "sequence, flow_id, timestamp, flow_type, method, host, path, status_code, request_size, response_size"
+# Cover ID deduplication as well as chronological seeks without table/BLOB pages.
+_HISTORY_INDEX = "CREATE INDEX IF NOT EXISTS flows_chronological ON flows(timestamp,sequence,flow_id)"
+_MAX_TIMESTAMP = 8.64e12  # JavaScript Date's range, expressed in seconds.
+_LIVE_SEQUENCE = 2**63 - 1
 _CHUNKS = """CREATE TABLE flow_payload_chunks (
     sequence INTEGER REFERENCES flows(sequence) ON DELETE CASCADE,
     ordinal INTEGER,
@@ -196,6 +200,50 @@ def _decompress(row: tuple) -> bytes:
     return raw
 
 
+def ensure_history_index(
+    path: str | Path, *, cancel: Callable[[], bool] | None = None
+) -> None:
+    """Add the chronological index to an existing recording, without payload writes.
+
+    Blocking: run in the history worker, not on the web event loop. This does not
+    create missing databases, change journal mode, or initialize a flow writer.
+    Cancellable requests bound SQLite lock waits as progress callbacks do not run
+    while another connection holds the write lock.
+    """
+    path = Path(path)
+    db: sqlite3.Connection | None = None
+    try:
+        if cancel and cancel():
+            raise StorageError("History request cancelled")
+        _secure_path(path, False)
+        db = sqlite3.connect(
+            path.absolute().as_uri() + "?mode=rw",
+            uri=True,
+            isolation_level=None,
+            timeout=0.1 if cancel else 5.0,
+        )
+        if cancel:
+            db.set_progress_handler(cancel, 1000)
+        db.execute("BEGIN IMMEDIATE")
+        _validate(db)
+        if cancel and cancel():
+            raise StorageError("History request cancelled")
+        db.execute(_HISTORY_INDEX)
+        if cancel and cancel():
+            raise StorageError("History request cancelled")
+        db.execute("COMMIT")
+    except sqlite3.Error as e:
+        raise StorageError(f"Cannot index flow database {path}: {e}") from e
+    finally:
+        if db is not None:
+            try:
+                db.set_progress_handler(None, 0)
+                if db.in_transaction:
+                    db.rollback()
+            finally:
+                db.close()
+
+
 def _metadata(f: flow.Flow) -> tuple:
     method = host = path = status = request_size = response_size = None
     if isinstance(f, http.HTTPFlow):
@@ -256,6 +304,7 @@ class SQLiteFlowStore:
                 self.db.execute("PRAGMA user_version=1")
             else:
                 _validate(self.db)
+            self.db.execute(_HISTORY_INDEX)
             self.db.execute("COMMIT")
             if self.db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
                 raise StorageError("Cannot enable SQLite WAL mode")
@@ -621,6 +670,279 @@ class SQLiteFlowReader:
             return [FlowMetadata(*row) for row in rows]
         except sqlite3.Error as e:
             raise StorageError(f"Cannot read flow metadata: {e}") from e
+
+    def history_page(
+        self,
+        *,
+        lower: float | None = None,
+        upper: float | None = None,
+        offset: int | None = None,
+        limit: int = 500,
+        after: tuple[float, int, str] | None = None,
+        before: tuple[float, int, str] | None = None,
+        live: list[dict] | None = None,
+        include_history: bool = True,
+        anchor: str | None = None,
+        selected: str | None = None,
+        count_only: bool = False,
+    ) -> dict:
+        """Return bounded metadata in ascending (timestamp, sequence, id) order.
+
+        Bounds are inclusive. An absent offset selects the newest page; an
+        absolute offset past the end returns an empty page at count. Cursors
+        are exclusive and cannot be combined with an offset or each other.
+        Anchor rank and selection eligibility describe the entire result set,
+        independently of the returned page. count_only skips row projection.
+
+        Supply every live ID, including nonmatching rows (matches=False), so
+        an older durable copy cannot reappear through search/global filters.
+        Live metadata wins, but durable sequence numbers are retained. New live
+        rows use the signed 64-bit maximum, which clients must preserve exactly
+        when constructing cursors. No native flow state or payload is read.
+        Install cancellation handlers per request: an interrupted rollback must
+        clear the progress handler to release its read snapshot.
+        """
+
+        def valid_timestamp(value):
+            return (
+                type(value) in (int, float)
+                and -_MAX_TIMESTAMP <= value <= _MAX_TIMESTAMP
+            )
+
+        def valid_id(value):
+            return isinstance(value, str) and 0 < len(value) <= 128
+
+        if (
+            (lower is not None and not valid_timestamp(lower))
+            or (upper is not None and not valid_timestamp(upper))
+            or (lower is not None and upper is not None and lower > upper)
+        ):
+            raise ValueError("Invalid history timestamp bounds")
+        if offset is not None and (
+            type(offset) is not int or not 0 <= offset <= 2**53 - 1
+        ):
+            raise ValueError("Invalid history offset")
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("History limit must be between 1 and 500")
+        for cursor_key in (after, before):
+            if cursor_key is not None and (
+                not isinstance(cursor_key, tuple)
+                or len(cursor_key) != 3
+                or not valid_timestamp(cursor_key[0])
+                or type(cursor_key[1]) is not int
+                or not 0 <= cursor_key[1] <= _LIVE_SEQUENCE
+                or not valid_id(cursor_key[2])
+            ):
+                raise ValueError("Invalid history cursor")
+        if (after is not None and before is not None) or (
+            (after is not None or before is not None) and offset is not None
+        ):
+            raise ValueError("Use one history cursor or an absolute offset")
+        if any(
+            value is not None and not valid_id(value) for value in (anchor, selected)
+        ):
+            raise ValueError("Invalid history flow ID")
+
+        live_values = []
+        live_ids = set()
+        for row in live or []:
+            if (
+                not isinstance(row, dict)
+                or not valid_id(row.get("id"))
+                or row["id"] in live_ids
+                or not valid_timestamp(row.get("timestamp_created"))
+                or not isinstance(row.get("type"), str)
+                or type(row.get("matches")) is not bool
+                or type(row.get("highlighted", False)) is not bool
+                or any(
+                    row.get(key) is not None and not isinstance(row[key], str)
+                    for key in ("method", "host", "path")
+                )
+                or any(
+                    row.get(key) is not None
+                    and (
+                        type(row[key]) is not int or not 0 <= row[key] <= _LIVE_SEQUENCE
+                    )
+                    for key in (
+                        "status_code",
+                        "request_size",
+                        "response_size",
+                        "payload_version",
+                    )
+                )
+            ):
+                raise ValueError("Invalid live history metadata")
+            live_ids.add(row["id"])
+            live_values.append(
+                (
+                    row["id"],
+                    row["timestamp_created"],
+                    row["type"],
+                    *(
+                        row.get(key)
+                        for key in (
+                            "method",
+                            "host",
+                            "path",
+                            "status_code",
+                            "request_size",
+                            "response_size",
+                            "payload_version",
+                        )
+                    ),
+                    row.get("highlighted", False),
+                    row["matches"],
+                )
+            )
+
+        parameters: dict = {
+            "lower": -_MAX_TIMESTAMP if lower is None else lower,
+            "upper": _MAX_TIMESTAMP if upper is None else upper,
+        }
+        bounds = "f.timestamp>=:lower AND f.timestamp<=:upper"
+        sources = []
+        if include_history:
+            source = f"FROM main.flows AS f WHERE {bounds}"
+            if live_values:
+                source += " AND NOT EXISTS (SELECT 1 FROM temp.history_live AS l WHERE l.flow_id=f.flow_id)"
+            sources.append((source, 0))
+        if live_values:
+            sources.append(
+                (f"FROM temp.history_live AS f WHERE {bounds} AND f.matches=1", 1)
+            )
+
+        def count(condition="", values=None):
+            if not sources:
+                return 0
+            sql = " UNION ALL ".join(
+                f"SELECT count(*) AS n {source} {condition}" for source, _ in sources
+            )
+            return self.db.execute(
+                f"SELECT sum(n) FROM ({sql})", parameters | (values or {})
+            ).fetchone()[0]
+
+        def identity(flow_id):
+            if flow_id is None or not sources:
+                return None
+            sql = " UNION ALL ".join(
+                f"SELECT f.timestamp,f.sequence,f.flow_id {source} AND f.flow_id=:identity"
+                for source, _ in sources
+            )
+            return self.db.execute(sql, parameters | {"identity": flow_id}).fetchone()
+
+        def position(key, *, inclusive=False):
+            return count(
+                f"AND (f.timestamp,f.sequence,f.flow_id) {'<=' if inclusive else '<'} (:timestamp,:sequence,:id)",
+                dict(zip(("timestamp", "sequence", "id"), key))
+                | {"upper": min(parameters["upper"], key[0])},
+            )
+
+        own_transaction = False
+        try:
+            if self.db.in_transaction:
+                raise StorageError("Cannot read history within an existing transaction")
+            self.db.execute("""CREATE TEMP TABLE IF NOT EXISTS history_live (
+                flow_id TEXT PRIMARY KEY, sequence INTEGER, timestamp REAL,
+                flow_type TEXT, method TEXT, host TEXT, path TEXT, status_code INTEGER,
+                request_size INTEGER, response_size INTEGER, payload_version INTEGER,
+                highlighted INTEGER, matches INTEGER
+            )""")
+            own_transaction = True
+            self.db.execute("BEGIN")
+            self.db.execute("DELETE FROM temp.history_live")
+            if live_values:
+                self.db.executemany(
+                    "INSERT INTO temp.history_live (flow_id,timestamp,flow_type,method,host,path,status_code,request_size,response_size,payload_version,highlighted,matches) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    live_values,
+                )
+                self.db.execute(
+                    f"UPDATE temp.history_live SET sequence=coalesce((SELECT sequence FROM main.flows WHERE flow_id=history_live.flow_id),{_LIVE_SEQUENCE})"
+                )
+                self.db.execute(
+                    "CREATE INDEX IF NOT EXISTS temp.history_live_chronological ON history_live(timestamp,sequence,flow_id)"
+                )
+            total = count()
+            anchor_key = identity(anchor)
+            anchor_position = position(anchor_key) if anchor_key else None
+            selected_eligible = identity(selected) is not None
+            cursor_condition = ""
+            skip = 0
+            if after is not None:
+                page_offset = position(after, inclusive=True)
+                cursor_condition = " AND (f.timestamp,f.sequence,f.flow_id) > (:timestamp,:sequence,:id)"
+            elif before is not None:
+                page_offset = max(0, position(before) - limit)
+                cursor_condition = " AND (f.timestamp,f.sequence,f.flow_id) < (:timestamp,:sequence,:id)"
+            else:
+                page_offset = (
+                    max(0, total - limit) if offset is None else min(offset, total)
+                )
+                skip = page_offset
+            result: dict = {
+                "count": total,
+                "offset": page_offset,
+                "rows": [],
+                "anchor_position": anchor_position,
+                "selected_eligible": selected_eligible,
+            }
+            if count_only or not total or not sources:
+                return result
+
+            keys = " UNION ALL ".join(
+                f"SELECT f.timestamp,f.sequence,f.flow_id,{is_live} AS live {source}{cursor_condition}"
+                for source, is_live in sources
+            )
+            direction = "DESC" if before is not None else "ASC"
+            projection = """substr(f.flow_id,1,128) AS id,f.sequence AS sequence,f.timestamp AS timestamp_created,
+                substr(f.flow_type,1,32) AS type,substr(f.method,1,64) AS method,
+                substr(f.host,1,1024) AS host,substr(f.path,1,4096) AS path,
+                f.status_code,f.request_size,f.response_size,f.payload_version"""
+            sql = f"""WITH page AS MATERIALIZED (
+                {keys} ORDER BY timestamp {direction},sequence {direction},flow_id {direction}
+                LIMIT :limit OFFSET :skip
+            )
+            SELECT {projection},0 AS live,0 AS highlighted
+            FROM page AS p JOIN main.flows AS f ON f.sequence=p.sequence WHERE p.live=0
+            UNION ALL
+            SELECT {projection},1 AS live,f.highlighted
+            FROM page AS p JOIN temp.history_live AS f ON f.flow_id=p.flow_id WHERE p.live=1
+            ORDER BY timestamp_created,sequence,id"""
+            page_parameters = parameters | {"limit": limit, "skip": skip}
+            page_cursor = after if after is not None else before
+            if page_cursor is not None:
+                page_parameters |= dict(
+                    zip(("timestamp", "sequence", "id"), page_cursor)
+                )
+                # The composite key also includes an unindexed ID; give SQLite
+                # an explicit timestamp bound so adjacent pages seek directly.
+                if after is not None:
+                    page_parameters["lower"] = max(parameters["lower"], after[0])
+                else:
+                    page_parameters["upper"] = min(parameters["upper"], page_cursor[0])
+            cursor = self.db.execute(sql, page_parameters)
+            columns = [column[0] for column in cursor.description]
+            for values in cursor:
+                row = dict(zip(columns, values))
+                row["live"] = bool(row["live"])
+                row["highlighted"] = bool(row["highlighted"])
+                result["rows"].append(row)
+            return result
+        except sqlite3.Error as e:
+            raise StorageError(f"Cannot read history metadata: {e}") from e
+        finally:
+            if own_transaction and self.db.in_transaction:
+                try:
+                    try:
+                        self.db.rollback()
+                    except sqlite3.OperationalError as e:
+                        if e.sqlite_errorcode != sqlite3.SQLITE_INTERRUPT:
+                            raise
+                        self.db.set_progress_handler(None, 0)
+                        self.db.rollback()
+                except sqlite3.Error as e:
+                    raise StorageError(
+                        f"Cannot end history read transaction: {e}"
+                    ) from e
 
     def close(self) -> None:
         self.db.close()

@@ -3,7 +3,20 @@ import asyncio
 import pytest
 
 from mitmproxy.options import Options
+from mitmproxy.tools.web.app import State
 from mitmproxy.tools.web.master import WebMaster
+
+
+async def test_instance_identity():
+    first = WebMaster(Options(), with_termlog=False)
+    second = WebMaster(Options(), with_termlog=False)
+    first.options.update(web_password="shared password")
+    second.options.update(web_password="shared password")
+    state = State.get_json(first)
+    assert len(bytes.fromhex(state["instance_id"])) == 32
+    assert state["instance_id"] == State.get_json(first)["instance_id"]
+    assert state["instance_id"] != State.get_json(second)["instance_id"]
+    assert state["sqlite_history"] is False
 
 
 async def test_reuse():

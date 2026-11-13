@@ -7,9 +7,11 @@ import FlowTableHead from "./FlowTable/FlowTableHead";
 import FlowRow from "./FlowTable/FlowRow";
 import type { Flow } from "../flow";
 import type { RootState } from "../ducks";
+import { selectTimeRangeFlows } from "../ducks/timeRange";
 
 type FlowTableProps = {
     flowView: Flow[];
+    appliedRangeKey: string | null;
     rowHeight: number;
     highlightedIds: Set<string>;
     selectedIds: Set<string>;
@@ -63,11 +65,13 @@ export class PureFlowTable extends React.Component<
         snapshot: boolean,
     ) {
         void prevState;
-        if (snapshot) {
+        const rangeChanged =
+            this.props.appliedRangeKey !== prevProps.appliedRangeKey;
+        if (snapshot || rangeChanged) {
             autoscroll.adjustScrollTop(this.viewport);
         }
-        // Only recompute the virtual-scroll window when the flow list
-        // or the row height actually changed. Other call sites still
+        // Only recompute the virtual-scroll window when the flow list,
+        // row height, or applied range changed. Other call sites still
         // drive onViewportUpdate as needed (componentDidMount, the
         // resize listener, the viewport onScroll, the post-scroll-into-
         // view call). Calling it unconditionally from here let
@@ -78,24 +82,29 @@ export class PureFlowTable extends React.Component<
         // setState condition kept re-firing.
         if (
             prevProps.flowView !== this.props.flowView ||
-            prevProps.rowHeight !== this.props.rowHeight
+            prevProps.rowHeight !== this.props.rowHeight ||
+            rangeChanged
         ) {
             this.onViewportUpdate();
         }
 
-        const { onlySelectedId } = this.props;
+        const { onlySelectedId, firstSelectedIndex, rowHeight } = this.props;
 
         const selectedPotentiallyOffscreenFlow =
             onlySelectedId && onlySelectedId !== prevProps.onlySelectedId;
 
-        if (selectedPotentiallyOffscreenFlow) {
-            const { rowHeight, firstSelectedIndex } = this.props;
+        if (
+            !rangeChanged &&
+            selectedPotentiallyOffscreenFlow &&
+            firstSelectedIndex !== undefined &&
+            firstSelectedIndex >= 0
+        ) {
             const viewport = this.viewport.current!;
             const head = this.head.current;
 
             const headHeight = head ? head.offsetHeight : 0;
 
-            const rowTop = firstSelectedIndex! * rowHeight + headHeight;
+            const rowTop = firstSelectedIndex * rowHeight + headHeight;
             const rowBottom = rowTop + rowHeight;
 
             const viewportTop = viewport.scrollTop;
@@ -187,17 +196,30 @@ export class PureFlowTable extends React.Component<
     }
 }
 
-export default connect((state: RootState) => ({
-    flowView: state.flows.view,
-    highlightedIds: state.flows.highlightedIds,
-    selectedIds: state.flows.selectedIds,
-    onlySelectedId:
-        state.flows.selected.length === 1 && state.flows.selected[0].id,
-    firstSelectedIndex: state.flows._viewIndex.get(state.flows.selected[0]?.id),
-    // Fetch column names once at the table level; avoids N identical
-    // useAppSelector subscriptions inside each FlowRow.
-    displayColumnNames: state.options.web_columns,
-    // Pass list index so the # column shows the original flow number
-    // (list position), not the view position after sort/filter.
-    listIndex: state.flows._listIndex,
-}))(PureFlowTable);
+export default connect((state: RootState) => {
+    const flowView = selectTimeRangeFlows(state);
+    const { instanceId, preference } = state.timeRange;
+    return {
+        flowView,
+        appliedRangeKey: instanceId
+            ? JSON.stringify(
+                  preference.mode === "relative"
+                      ? [preference.mode, preference.duration]
+                      : [preference.mode, preference.from, preference.until],
+              )
+            : null,
+        highlightedIds: state.flows.highlightedIds,
+        selectedIds: state.flows.selectedIds,
+        onlySelectedId:
+            state.flows.selected.length === 1 && state.flows.selected[0].id,
+        firstSelectedIndex: flowView.findIndex(
+            (flow) => flow.id === state.flows.selected[0]?.id,
+        ),
+        // Fetch column names once at the table level; avoids N identical
+        // useAppSelector subscriptions inside each FlowRow.
+        displayColumnNames: state.options.web_columns,
+        // Pass list index so the # column shows the original flow number
+        // (list position), not the view position after sort/filter.
+        listIndex: state.flows._listIndex,
+    };
+})(PureFlowTable);

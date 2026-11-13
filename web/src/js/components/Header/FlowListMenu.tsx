@@ -5,6 +5,7 @@ import Button from "../common/Button";
 import { update as updateOptions } from "../../ducks/options";
 import { useAppDispatch, useAppSelector } from "../../ducks";
 import { FilterName, setFilter, setHighlight } from "../../ducks/ui/filter";
+import TimeRangeSelector from "./TimeRangeSelector";
 
 FlowListMenu.title = "Flow List";
 
@@ -13,6 +14,7 @@ export default function FlowListMenu() {
         <div className="main-menu">
             <div className="menu-group">
                 <div className="menu-content">
+                    <TimeRangeSelector />
                     <FlowFilterInput />
                     <HighlightInput />
                 </div>

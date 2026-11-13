@@ -260,6 +260,56 @@ header {
     margin: 4px 0;
 }
 
+header > div:has(.time-range-selector) {
+    height: @menu-height + 28px;
+
+    .menu-group {
+        height: @menu-height + 28px;
+    }
+
+    .menu-content {
+        height: @menu-height - @menu-legend-height + 28px;
+    }
+}
+
+.time-range-selector {
+    position: relative;
+    max-width: calc(100vw - 32px);
+    padding-top: 3px;
+
+    summary {
+        max-width: 100%;
+        padding: 1px 6px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .popover {
+        display: block;
+        top: 100%;
+        left: 0;
+        width: 300px;
+        max-width: calc(100vw - 32px);
+    }
+
+    label {
+        display: block;
+        margin-bottom: 8px;
+    }
+
+    fieldset {
+        border: 0;
+        padding: 0;
+        margin: 0;
+    }
+
+    .input {
+        height: 30px;
+        padding: 4px 8px;
+        font-size: 12px;
+    }
+}
+
 .filter-input .popover {
     top: 27px;
     left: 43px;

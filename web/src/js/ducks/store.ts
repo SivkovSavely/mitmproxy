@@ -15,6 +15,8 @@ import options_meta from "./options_meta";
 import modes from "./modes";
 import processes from "./processes";
 import responsePreview from "./responsePreview";
+import timeRange from "./timeRange";
+import history from "./history";
 
 export const reducer = {
     commandBar,
@@ -29,6 +31,8 @@ export const reducer = {
     processes,
     scripts,
     responsePreview,
+    timeRange,
+    history,
 };
 
 export const middlewares = {

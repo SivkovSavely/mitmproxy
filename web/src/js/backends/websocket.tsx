@@ -5,8 +5,7 @@
  */
 import { assertNever, fetchApi } from "../utils";
 import * as connectionActions from "../ducks/connection";
-import type { Store } from "redux";
-import type { RootState } from "../ducks";
+import type { RootStore } from "../ducks";
 import { STATE_RECEIVE, STATE_UPDATE } from "../ducks/backendState";
 import { EVENTS_ADD, EVENTS_RECEIVE } from "../ducks/eventLog";
 import { OPTIONS_RECEIVE, OPTIONS_UPDATE } from "../ducks/options";
@@ -26,6 +25,13 @@ import {
     FilterName,
     initialState as initialFilterState,
 } from "../ducks/ui/filter";
+import {
+    backendConnecting,
+    establishBackend,
+    invalidateHistory,
+    pruneLegacySelection,
+} from "../ducks/timeRange";
+import { clearSelection } from "../ducks/history";
 
 export enum Resource {
     State = "state",
@@ -50,8 +56,10 @@ type WebsocketMessageType =
     | "response/preview";
 
 export default class WebsocketBackend {
-    activeFetches: Partial<{ [key in Resource]: Array<Action> }>;
-    store: Store<RootState>;
+    activeFetches: Partial<
+        Record<Resource, { queue: Array<Action>; controller: AbortController }>
+    >;
+    store: RootStore;
     filterState: typeof initialFilterState;
     socket: WebSocket;
     messageQueue: Action[];
@@ -60,6 +68,9 @@ export default class WebsocketBackend {
     previewSubscription = 0;
     previewDisconnected = false;
     previewResetting = false;
+    connectionGeneration = 0;
+    establishing = false;
+    historyMode = false;
 
     constructor(store) {
         this.activeFetches = {};
@@ -71,46 +82,105 @@ export default class WebsocketBackend {
     }
 
     connect() {
-        this.socket = new WebSocket(
+        this.connectionGeneration++;
+        this.abortFetches();
+        this.previewDisconnected = true;
+        this.store.dispatch(backendConnecting());
+        this.clearResponseSubscription();
+        const socket = new WebSocket(
             location.origin.replace("http", "ws") +
                 location.pathname.replace(/\/$/, "") +
                 "/updates",
         );
-        this.socket.addEventListener("open", () => this.onOpen());
-        this.socket.addEventListener("close", (event) => this.onClose(event));
-        this.socket.addEventListener("message", (msg) =>
-            this.onMessage(JSON.parse(msg.data)),
-        );
-        this.socket.addEventListener("error", (error) => this.onError(error));
+        this.socket = socket;
+        socket.addEventListener("open", () => {
+            if (this.socket === socket) this.onOpen();
+        });
+        socket.addEventListener("close", (event) => {
+            if (this.socket === socket) this.onClose(event);
+        });
+        socket.addEventListener("message", (msg) => {
+            if (this.socket === socket) this.onMessage(JSON.parse(msg.data));
+        });
+        socket.addEventListener("error", (error) => {
+            if (this.socket === socket) this.onError(error);
+        });
     }
 
     async onOpen() {
+        const generation = ++this.connectionGeneration;
+        this.establishing = true;
+        this.store.dispatch(backendConnecting());
         this.previewDisconnected = false;
-        // Send all queued messages.
-        for (const message of this.messageQueue) {
-            this.socket.send(JSON.stringify(message));
-        }
-        this.messageQueue = [];
-        // useful side effect: onStoreUpdate will be called
+        this.clearResponseSubscription();
+        this.abortFetches();
         this.store.dispatch(connectionActions.startFetching());
-        await Promise.all([
-            this.fetchData(Resource.State),
-            this.fetchData(Resource.Flows),
-            this.fetchData(Resource.Events),
-            this.fetchData(Resource.Options),
-            this.fetchData(Resource.Scripts),
-        ]);
-        this.store.dispatch(connectionActions.finishFetching());
+        try {
+            await this.fetchData(Resource.State);
+            if (
+                generation !== this.connectionGeneration ||
+                !this.store.getState().timeRange.ready
+            )
+                return;
+            const historyMode =
+                this.store.getState().backendState.sqlite_history;
+            if (historyMode || this.historyMode !== historyMode)
+                this.clearLiveFlows();
+            this.historyMode = historyMode;
+            this.store.dispatch(invalidateHistory());
+            this.establishing = false;
+            for (const message of this.messageQueue)
+                this.socket.send(JSON.stringify(message));
+            this.messageQueue = [];
+            // Filters are per WebSocket connection, not backend instance.
+            this.filterState = initialFilterState;
+            this.sendFilters(true);
+            await Promise.all([
+                this.fetchData(Resource.Flows),
+                this.fetchData(Resource.Events),
+                this.fetchData(Resource.Options),
+                this.fetchData(Resource.Scripts),
+            ]);
+            if (generation === this.connectionGeneration)
+                this.store.dispatch(connectionActions.finishFetching());
+        } catch (error) {
+            if (generation !== this.connectionGeneration) return;
+            this.store.dispatch(backendConnecting());
+            this.store.dispatch(
+                connectionActions.connectionError(String(error)),
+            );
+        } finally {
+            if (generation === this.connectionGeneration)
+                this.establishing = false;
+        }
     }
 
     onStoreUpdate() {
+        const state = this.store.getState();
+        if (!state.timeRange.ready || this.establishing) return;
+        if (this.historyMode !== state.backendState.sqlite_history) {
+            this.historyMode = state.backendState.sqlite_history;
+            this.clearLiveFlows();
+            this.store.dispatch(invalidateHistory());
+            if (!this.historyMode)
+                this.fetchData(Resource.Flows).catch((error) => {
+                    this.store.dispatch(
+                        connectionActions.connectionError(String(error)),
+                    );
+                });
+        }
+        this.store.dispatch(pruneLegacySelection());
         this.updateResponseSubscription();
+        this.sendFilters();
+    }
+
+    sendFilters(force = false) {
         const storeFilterState = this.store.getState().ui.filter;
-        if (storeFilterState === this.filterState) {
+        if (!force && storeFilterState === this.filterState) {
             return;
         }
         for (const name of Object.values(FilterName)) {
-            if (this.filterState[name] !== storeFilterState[name]) {
+            if (force || this.filterState[name] !== storeFilterState[name]) {
                 this.sendMessage({
                     type: "flows/updateFilter",
                     payload: {
@@ -136,6 +206,7 @@ export default class WebsocketBackend {
             state.ui.tabs.current !== Tab.Capture &&
             state.ui.tabs.current !== Tab.Scripts;
         const connected =
+            state.timeRange.ready &&
             this.socket.readyState === WebSocket.OPEN &&
             !this.previewDisconnected &&
             state.connection.state !== connectionActions.ConnectionState.ERROR;
@@ -174,15 +245,48 @@ export default class WebsocketBackend {
     }
 
     fetchData(resource: Resource) {
+        this.abortFetches(resource);
+        const state = this.store.getState();
+        if (
+            resource === Resource.Flows &&
+            (!state.timeRange.ready || state.backendState.sqlite_history)
+        )
+            return Promise.resolve();
+        const generation = this.connectionGeneration;
         const queue: Array<Action> = [];
-        this.activeFetches[resource] = queue;
-        return fetchApi(`./${resource}`)
-            .then((res) => res.json())
+        const controller = new AbortController();
+        this.activeFetches[resource] = { queue, controller };
+        const current = () =>
+            !controller.signal.aborted &&
+            generation === this.connectionGeneration &&
+            this.activeFetches[resource]?.queue === queue;
+        return fetchApi(`./${resource}`, { signal: controller.signal })
+            .then((res) => {
+                if (!current()) return;
+                if (!res.ok)
+                    throw new Error(
+                        `Fetching ${resource} failed (${res.status}).`,
+                    );
+                return res.json();
+            })
             .then((json) => {
-                // Make sure that we are not superseded yet by the server sending a RESET.
-                if (this.activeFetches[resource] === queue)
-                    this.receive(resource, json);
+                if (current()) this.receive(resource, json);
+            })
+            .catch((error) => {
+                if (!controller.signal.aborted) throw error;
+            })
+            .finally(() => {
+                if (this.activeFetches[resource]?.queue === queue)
+                    delete this.activeFetches[resource];
             });
+    }
+
+    abortFetches(resource?: Resource) {
+        for (const name of resource ? [resource] : Object.values(Resource)) {
+            const active = this.activeFetches[name];
+            delete this.activeFetches[name];
+            active?.controller.abort();
+        }
     }
 
     onMessage(msg: {
@@ -190,6 +294,50 @@ export default class WebsocketBackend {
         payload?: any;
         scripts?: ScriptStatus[];
     }) {
+        if (msg.type.startsWith("flows/")) {
+            const state = this.store.getState();
+            if (!state.timeRange.ready) return;
+            if (state.backendState.sqlite_history) {
+                this.store.dispatch(invalidateHistory());
+                const selected = state.history.selected;
+                switch (msg.type) {
+                    case "flows/add":
+                    case "flows/update": {
+                        const id = msg.payload.flow.id;
+                        if (state.flows.byId.has(id))
+                            this.store.dispatch(FLOWS_UPDATE(msg.payload));
+                        else if (selected?.live && selected.id === id)
+                            this.store.dispatch(FLOWS_ADD(msg.payload));
+                        return;
+                    }
+                    case "flows/remove":
+                        if (selected?.id === msg.payload)
+                            this.store.dispatch(clearSelection());
+                        if (
+                            state.flows.byId.has(msg.payload) ||
+                            selected?.id === msg.payload
+                        )
+                            this.store.dispatch(FLOWS_REMOVE(msg.payload));
+                        return;
+                    case "flows/filterUpdate":
+                        if (state.flows.byId.size)
+                            this.store.dispatch(
+                                FLOWS_FILTER_UPDATE({
+                                    ...msg.payload,
+                                    matching_flow_ids:
+                                        msg.payload.matching_flow_ids?.filter(
+                                            (id: string) =>
+                                                state.flows.byId.has(id),
+                                        ) ?? null,
+                                }),
+                            );
+                        return;
+                    case "flows/reset":
+                        this.clearLiveFlows();
+                        return;
+                }
+            }
+        }
         switch (msg.type) {
             case "response/preview":
                 return this.store.dispatch(
@@ -220,11 +368,18 @@ export default class WebsocketBackend {
                     Resource.Events,
                     EVENTS_ADD(msg.payload),
                 );
-            case "options/update":
-                return this.queueOrDispatch(
+            case "options/update": {
+                // The option alone does not establish the current backend capability.
+                const refreshed =
+                    msg.payload && "save_sqlite_file" in msg.payload
+                        ? this.onOpen()
+                        : undefined;
+                this.queueOrDispatch(
                     Resource.Options,
                     OPTIONS_UPDATE(msg.payload),
                 );
+                return refreshed;
+            }
             case "state/update":
                 return this.queueOrDispatch(
                     Resource.State,
@@ -258,7 +413,7 @@ export default class WebsocketBackend {
     }
 
     queueOrDispatch(resource: Resource, action: Action) {
-        const queue = this.activeFetches[resource];
+        const queue = this.activeFetches[resource]?.queue;
         if (queue !== undefined) {
             queue.push(action);
         } else {
@@ -269,7 +424,15 @@ export default class WebsocketBackend {
     receive(resource: Resource, data) {
         switch (resource) {
             case Resource.State:
+                if (
+                    typeof data.instance_id !== "string" ||
+                    !data.instance_id.trim()
+                )
+                    throw new Error("Backend state has no instance ID.");
+                if (typeof data.sqlite_history !== "boolean")
+                    throw new Error("Backend state has no history capability.");
                 this.store.dispatch(STATE_RECEIVE(data));
+                this.store.dispatch(establishBackend(data.instance_id));
                 break;
             case Resource.Options:
                 this.store.dispatch(OPTIONS_RECEIVE(data));
@@ -278,7 +441,8 @@ export default class WebsocketBackend {
                 this.store.dispatch(EVENTS_RECEIVE(data));
                 break;
             case Resource.Flows:
-                this.store.dispatch(FLOWS_RECEIVE(data));
+                if (!this.store.getState().backendState.sqlite_history)
+                    this.store.dispatch(FLOWS_RECEIVE(data));
                 break;
             case Resource.Scripts:
                 this.store.dispatch(SCRIPTS_RECEIVE(data.scripts));
@@ -287,13 +451,23 @@ export default class WebsocketBackend {
             default:
                 assertNever(resource);
         }
-        const queue = this.activeFetches[resource]!;
+        const queue = this.activeFetches[resource]!.queue;
         delete this.activeFetches[resource];
         queue.forEach((msg) => this.store.dispatch(msg));
         if (resource === Resource.Flows) {
             this.previewResetting = false;
             this.onStoreUpdate();
         }
+    }
+
+    clearLiveFlows() {
+        this.abortFetches(Resource.Flows);
+        this.previewResetting = true;
+        this.clearResponseSubscription();
+        if (this.store.getState().history.selected?.live)
+            this.store.dispatch(clearSelection());
+        this.store.dispatch(FLOWS_RECEIVE([]));
+        this.previewResetting = false;
     }
 
     clearResponseSubscription() {
@@ -315,7 +489,10 @@ export default class WebsocketBackend {
     }
 
     onClose(closeEvent: CloseEvent) {
+        this.connectionGeneration++;
+        this.abortFetches();
         this.previewDisconnected = true;
+        this.store.dispatch(backendConnecting());
         this.clearResponseSubscription();
         this.store.dispatch(
             connectionActions.connectionError(
@@ -328,9 +505,14 @@ export default class WebsocketBackend {
     }
 
     onError(...args) {
+        this.connectionGeneration++;
+        this.abortFetches();
         this.previewDisconnected = true;
+        this.store.dispatch(backendConnecting());
         this.clearResponseSubscription();
-        // FIXME
+        this.store.dispatch(
+            connectionActions.connectionError("WebSocket connection failed."),
+        );
         console.error("websocket connection errored", args);
     }
 }

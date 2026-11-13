@@ -13,6 +13,7 @@ import secrets
 import shutil
 import sys
 import tempfile
+import threading
 import zipfile
 from collections.abc import Callable
 from collections.abc import Sequence
@@ -42,8 +43,10 @@ from mitmproxy import optmanager
 from mitmproxy import version
 from mitmproxy.dns import DNSFlow
 from mitmproxy.http import HTTPFlow
+from mitmproxy.io import sqlite
 from mitmproxy.tcp import TCPFlow
 from mitmproxy.tcp import TCPMessage
+from mitmproxy.tools.web import history
 from mitmproxy.tools.web.webaddons import WebAuth
 from mitmproxy.udp import UDPFlow
 from mitmproxy.udp import UDPMessage
@@ -551,6 +554,66 @@ class Flows(RequestHandler):
         self.write([flow_to_json(f) for f in self.view])
 
 
+class FlowHistory(RequestHandler):
+    def initialize(self):
+        self.cancel = threading.Event()
+
+    async def get(self, count: str | None = None):
+        if (
+            self.get_query_argument("instance_id", None, strip=False)
+            != self.master.instance_id
+        ):
+            raise APIError(
+                409, "Web instance changed; refresh state before querying history."
+            )
+        configured_path = self.master.options.save_sqlite_file
+        if not configured_path:
+            raise APIError(409, "SQLite flow history is disabled.")
+        try:
+            query = history.HistoryQuery.parse(
+                {
+                    name: self.get_query_argument(name, strip=False)
+                    for name in self.request.query_arguments
+                }
+            )
+        except ValueError as error:
+            raise APIError(400, str(error)) from error
+        self.set_header("Cache-Control", "no-store")
+        generation = self.master.history.generation
+        live = self.view.resolve("@all")
+        path = os.path.abspath(os.path.expanduser(configured_path))
+        try:
+            page = await self.master.history.page(
+                path, query, live, self.cancel, count_only=count is not None
+            )
+        except history.HistoryBusy:
+            raise APIError(503, "Flow history is busy; retry later.") from None
+        except sqlite.StorageError as error:
+            if self.cancel.is_set():
+                return
+            logger.warning("Cannot read flow history: %s", error)
+            raise APIError(503, "Flow history is unavailable.") from error
+        if self.cancel.is_set():
+            return
+        if generation != self.master.history.generation:
+            raise APIError(
+                409, "SQLite flow history configuration changed; retry the query."
+            )
+        self.write(
+            page
+            | {
+                "instance_id": self.master.instance_id,
+                "lower": query.lower,
+                "upper": query.upper,
+                "historical_search_unsupported": query.search is not None,
+                "historical_highlight_unsupported": query.highlight is not None,
+            }
+        )
+
+    def on_connection_close(self):
+        self.cancel.set()
+
+
 class DumpFlows(RequestHandler):
     def get(self) -> None:
         self.set_header("Content-Disposition", "attachment; filename=flows")
@@ -621,6 +684,9 @@ class KillFlow(RequestHandler):
 
 
 class FlowHandler(RequestHandler):
+    def get(self, flow_id):
+        self.write(flow_to_json(self.flow))
+
     def delete(self, flow_id):
         if self.flow.killable:
             self.flow.kill()
@@ -1004,6 +1070,8 @@ class State(RequestHandler):
     @staticmethod
     def get_json(master: mitmproxy.tools.web.master.WebMaster):
         return {
+            "instance_id": master.instance_id,
+            "sqlite_history": bool(master.options.save_sqlite_file),
             "version": version.VERSION,
             "contentViews": [
                 v for v in contentviews.registry.available_views() if v != "query"
@@ -1070,6 +1138,7 @@ handlers = [
     (r"/commands/(?P<cmd>[a-z.]+)", ExecuteCommand),
     (r"/events(?:\.json)?", Events),
     (r"/flows(?:\.json)?", Flows),
+    (r"/flow-history(?P<count>/count)?", FlowHistory),
     (r"/flows/dump", DumpFlows),
     (r"/flows/resume", ResumeFlows),
     (r"/flows/kill", KillFlows),

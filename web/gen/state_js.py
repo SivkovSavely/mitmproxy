@@ -49,6 +49,7 @@ async def make() -> str:
     data.update(available=True)
     data["contentViews"] = ["auto", "Raw"]
     data["version"] = "1.2.3"
+    data["instance_id"] = "test-backend-instance"
     data["platform"] = "darwin"
     data["localModeUnavailable"] = None
 
