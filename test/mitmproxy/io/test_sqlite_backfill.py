@@ -1,9 +1,13 @@
+import hashlib
+import io
 import os
 import sqlite3
 
 import pytest
 
+from mitmproxy.io import FlowReader
 from mitmproxy.io import sqlite
+from mitmproxy.io import tnetstring
 from mitmproxy.io.sqlite_backfill import Source
 from mitmproxy.io.sqlite_backfill import SQLiteBackfillStore
 from mitmproxy.test import tflow
@@ -219,3 +223,213 @@ def test_update_reserves_space_for_old_payload_wal_pages(tmp_path):
             == "updated"
         )
         assert checked[0] >= old_size
+
+
+def test_chunked_provenance_updates_and_protects_independent_rows(tmp_path):
+    src = source(tmp_path)
+    f = tflow.tflow(resp=True)
+    f.response.raw_content = os.urandom(8192)
+    independent = tflow.tflow()
+    with sqlite.SQLiteFlowStore(tmp_path / "db") as store:
+        store.write(independent.get_state())
+    with SQLiteBackfillStore(tmp_path / "db") as store:
+        rev = store.start_source(src)
+
+        def put(value, ordinal):
+            raw = tnetstring.dumps(value.get_state())
+            return store.write_raw(
+                sqlite._metadata(value),
+                io.BytesIO(raw),
+                len(raw),
+                hashlib.sha256(raw).digest(),
+                src,
+                rev,
+                ordinal,
+                chunk_size=1024,
+            )
+
+        assert put(f, 0).status == "inserted"
+        assert put(f, 0).status == "existing"
+        f.comment = "later"
+        assert put(f, 1).status == "updated"
+        independent.comment = "cannot overwrite"
+        assert put(independent, 2).status == "existing"
+        with sqlite.SQLiteFlowReader(tmp_path / "db") as reader:
+            restored = next(
+                FlowReader(io.BytesIO(b"".join(reader.iter_raw(f.id)))).stream()
+            )
+            assert restored.get_state() == f.get_state()
+            assert reader.get_flow(independent.id).comment == ""
+        store.db.execute(
+            "CREATE TRIGGER fail_provenance BEFORE INSERT ON backfill_provenance BEGIN SELECT RAISE(ABORT, 'disk full'); END"
+        )
+        f.comment = "not committed"
+        with pytest.raises(sqlite.StorageError, match="ordinal=3"):
+            put(f, 3)
+        with sqlite.SQLiteFlowReader(tmp_path / "db") as reader:
+            assert (
+                tnetstring.loads(b"".join(reader.iter_raw(f.id)))["comment"] == "later"
+            )
+
+
+def test_raw_identity_survives_switching_import_representation(tmp_path):
+    src = source(tmp_path)
+    f = tflow.tflow()
+    canonical = tnetstring.dumps(f.get_state())
+    raw = b"0" + canonical
+    digest = hashlib.sha256(raw).digest()
+    with SQLiteBackfillStore(tmp_path / "db") as store:
+        rev = store.start_source(src)
+        assert (
+            store.write_flow(f, src, rev, 0, native_digest=digest).status == "inserted"
+        )
+        assert (
+            store.write_raw(
+                sqlite._metadata(f), io.BytesIO(raw), len(raw), digest, src, rev, 0
+            ).status
+            == "existing"
+        )
+        assert (
+            store.write_raw(
+                sqlite._metadata(f), io.BytesIO(raw), len(raw), digest, src, rev, 1
+            ).status
+            == "existing"
+        )
+        assert (
+            store.write_flow(f, src, rev, 1, native_digest=digest).status == "existing"
+        )
+
+
+def test_resume_legacy_normalized_provenance_without_replacing_payload(tmp_path):
+    src = source(tmp_path)
+    f = tflow.tflow()
+    raw = b"0" + tnetstring.dumps(f.get_state())
+    digest = hashlib.sha256(raw).digest()
+    with SQLiteBackfillStore(tmp_path / "db") as store:
+        rev = store.start_source(src)
+        store.write_flow(f, src, rev, 0)
+        before = store.db.execute("SELECT sequence,payload FROM flows").fetchone()
+        assert (
+            store.write_raw(
+                sqlite._metadata(f),
+                io.BytesIO(raw),
+                len(raw),
+                digest,
+                src,
+                rev,
+                0,
+                resume_legacy=True,
+            ).status
+            == "existing"
+        )
+        assert (
+            store.db.execute("SELECT sequence,payload FROM flows").fetchone() == before
+        )
+        assert (
+            store.db.execute("SELECT digest FROM backfill_native_identity").fetchone()[
+                0
+            ]
+            == digest
+        )
+        assert (
+            store.write_raw(
+                sqlite._metadata(f),
+                io.BytesIO(raw),
+                len(raw),
+                digest,
+                src,
+                rev,
+                0,
+            ).status
+            == "existing"
+        )
+
+
+def test_incompatible_native_identity_schema_is_rejected(tmp_path):
+    path = tmp_path / "db"
+    with SQLiteBackfillStore(path) as store:
+        store.db.execute("DROP TABLE backfill_native_identity")
+        store.db.execute("CREATE TABLE backfill_native_identity (wrong TEXT)")
+    with pytest.raises(sqlite.StorageError, match="native provenance schema"):
+        SQLiteBackfillStore(path)
+
+
+def test_later_different_native_encoding_can_replace_v1_with_exact_v2(tmp_path):
+    src = source(tmp_path)
+    f = tflow.tflow()
+    canonical = tnetstring.dumps(f.get_state())
+    original = b"0" + canonical
+    with SQLiteBackfillStore(tmp_path / "db") as store:
+        rev = store.start_source(src)
+        store.write_flow(
+            f, src, rev, 0, native_digest=hashlib.sha256(canonical).digest()
+        )
+        result = store.write_raw(
+            sqlite._metadata(f),
+            io.BytesIO(original),
+            len(original),
+            hashlib.sha256(original).digest(),
+            src,
+            rev,
+            1,
+        )
+        assert (result.status, result.conflicting) == ("updated", True)
+        with sqlite.SQLiteFlowReader(tmp_path / "db") as reader:
+            assert reader.newest(1)[0].sequence == 1
+            assert b"".join(reader.iter_raw(f.id)) == original
+            with pytest.raises(sqlite.StorageError, match="iter_raw"):
+                reader.get_flow(f.id)
+
+
+def test_chunked_sqlite_full_and_interrupt_preserve_committed_state(tmp_path):
+    src = source(tmp_path)
+    committed, pending = tflow.tflow(), tflow.tflow(resp=True)
+    pending.response.raw_content = os.urandom(128 * 1024)
+    raw = tnetstring.dumps(pending.get_state())
+    with SQLiteBackfillStore(tmp_path / "db") as store:
+        rev = store.start_source(src)
+        store.write_flow(committed, src, rev, 0)
+        pages = store.db.execute("PRAGMA page_count").fetchone()[0]
+        store.db.execute(f"PRAGMA max_page_count={pages}")
+
+        def put(**kwargs):
+            return store.write_raw(
+                sqlite._metadata(pending),
+                io.BytesIO(raw),
+                len(raw),
+                hashlib.sha256(raw).digest(),
+                src,
+                rev,
+                1,
+                chunk_size=1024,
+                **kwargs,
+            )
+
+        with pytest.raises(sqlite.StorageError, match="full"):
+            put()
+        store.db.execute("PRAGMA max_page_count=1073741823")
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            put(check=interrupt)
+        assert store.db.execute("SELECT flow_id FROM flows").fetchall() == [
+            (committed.id,)
+        ]
+        assert store.db.execute(
+            "SELECT flow_id FROM backfill_provenance"
+        ).fetchall() == [(committed.id,)]
+        assert store.db.execute(
+            "SELECT complete FROM backfill_manifest"
+        ).fetchall() == [(0,)]
+        assert (
+            store.db.execute(
+                "SELECT name FROM sqlite_master WHERE name='flow_payload_chunks'"
+            ).fetchone()
+            is None
+        )
+        assert put().status == "inserted"
+        with sqlite.SQLiteFlowReader(tmp_path / "db") as reader:
+            assert reader.get_flow(committed.id).get_state() == committed.get_state()
+            assert b"".join(reader.iter_raw(pending.id)) == raw

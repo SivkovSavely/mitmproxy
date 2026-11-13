@@ -10,15 +10,20 @@ trusted sticky ancestors such as /tmp are permitted. Symlink ancestors are not.
 """
 
 import copy
+import hashlib
 import os
 import sqlite3
 import stat
 import sys
 import threading
 from collections import deque
+from collections.abc import Callable
+from collections.abc import Iterable
+from collections.abc import Iterator
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 if sys.version_info >= (3, 14):
     from compression import zstd
@@ -72,6 +77,14 @@ _SCHEMA = """CREATE TABLE flows (
     payload BLOB NOT NULL
 )"""
 _COLUMNS = "sequence, flow_id, timestamp, flow_type, method, host, path, status_code, request_size, response_size"
+_CHUNKS = """CREATE TABLE flow_payload_chunks (
+    sequence INTEGER REFERENCES flows(sequence) ON DELETE CASCADE,
+    ordinal INTEGER,
+    raw_length INTEGER,
+    payload BLOB NOT NULL,
+    PRIMARY KEY(sequence, ordinal)
+)"""
+_MAX_CHUNK = 8 * 1024 * 1024
 
 
 def _validate(db: sqlite3.Connection, *, allow_empty: bool = False) -> None:
@@ -85,6 +98,30 @@ def _validate(db: sqlite3.Connection, *, allow_empty: bool = False) -> None:
             return
     if app != _APP_ID or version != 1 or not schema or schema[0] != _SCHEMA:
         raise StorageError("Incompatible or invalid flow database schema")
+    _validate_chunks(db)
+
+
+def _validate_chunks(db: sqlite3.Connection) -> None:
+    chunks = db.execute(
+        "SELECT type,sql FROM sqlite_master WHERE name='flow_payload_chunks'"
+    ).fetchone()
+    if chunks and chunks != ("table", _CHUNKS):
+        raise StorageError("Incompatible or invalid flow database schema")
+
+
+def _error_detail(e: Exception) -> str:
+    detail = type(e).__name__
+    if isinstance(e, sqlite3.Error):
+        name = getattr(e, "sqlite_errorname", None)
+        if name:
+            detail += f" {name}"
+        if str(e) in (
+            "database or disk is full",
+            "disk full",
+            "string or blob too big",
+        ):
+            detail += f" {e}"
+    return detail
 
 
 def _secure_directory(path: Path) -> None:
@@ -233,29 +270,150 @@ class SQLiteFlowStore:
     def _write_payload(
         self, f: flow.Flow, raw: bytes, sequence: int | None = None
     ) -> int:
-        payload = zstd.compress(
-            raw,
-            options={
-                zstd.CompressionParameter.compression_level: 3,
-                zstd.CompressionParameter.checksum_flag: 1,
-            },
-        )
-        values = (*_metadata(f), len(raw), payload)
-        if sequence is None:
-            cursor = self.db.execute(
-                "INSERT INTO flows (flow_id,timestamp,flow_type,method,host,path,status_code,request_size,response_size,payload_version,codec,dictionary_id,raw_length,payload) VALUES (?,?,?,?,?,?,?,?,?,1,'zstd',NULL,?,?)",
-                values,
+        try:
+            payload = zstd.compress(
+                raw,
+                options={
+                    zstd.CompressionParameter.compression_level: 3,
+                    zstd.CompressionParameter.checksum_flag: 1,
+                },
             )
-            assert cursor.lastrowid is not None
-            return cursor.lastrowid
+        except Exception as e:
+            raise StorageError(
+                f"stage=zstd.compress raw_length={len(raw)} compressed_length=unknown {type(e).__name__}"
+            ) from None
+        values = (*_metadata(f), len(raw), payload)
+        try:
+            if sequence is None:
+                cursor = self.db.execute(
+                    "INSERT INTO flows (flow_id,timestamp,flow_type,method,host,path,status_code,request_size,response_size,payload_version,codec,dictionary_id,raw_length,payload) VALUES (?,?,?,?,?,?,?,?,?,1,'zstd',NULL,?,?)",
+                    values,
+                )
+                assert cursor.lastrowid is not None
+                return cursor.lastrowid
+            if self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='flow_payload_chunks'"
+            ).fetchone():
+                self.db.execute(
+                    "DELETE FROM flow_payload_chunks WHERE sequence=?", (sequence,)
+                )
+            self.db.execute(
+                "UPDATE flows SET flow_id=?,timestamp=?,flow_type=?,method=?,host=?,path=?,status_code=?,request_size=?,response_size=?,payload_version=1,codec='zstd',dictionary_id=NULL,raw_length=?,payload=? WHERE sequence=?",
+                (*values, sequence),
+            )
+            return sequence
+        except Exception as e:
+            raise StorageError(
+                f"stage=sqlite.{'insert' if sequence is None else 'update'} raw_length={len(raw)} compressed_length={len(payload)} {_error_detail(e)}"
+            ) from None
+
+    def _stored_size(self, sequence: int) -> int:
+        row = self.db.execute(
+            "SELECT length(payload) FROM flows WHERE sequence=?", (sequence,)
+        ).fetchone()
+        if row is None:
+            raise StorageError("Flow not found")
+        if self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='flow_payload_chunks'"
+        ).fetchone():
+            return (
+                row[0]
+                + self.db.execute(
+                    "SELECT coalesce(sum(length(payload)),0) FROM flow_payload_chunks WHERE sequence=?",
+                    (sequence,),
+                ).fetchone()[0]
+            )
+        return row[0]
+
+    def _write_chunked(
+        self,
+        metadata: tuple,
+        raw: BinaryIO,
+        raw_length: int,
+        digest: bytes,
+        sequence: int | None = None,
+        *,
+        chunk_size: int = 1024 * 1024,
+        check: Callable[[], None] | None = None,
+    ) -> int:
+        if not self.db.in_transaction:
+            raise StorageError("Chunked write requires a transaction")
+        limit = self.db.getlimit(sqlite3.SQLITE_LIMIT_LENGTH) - 1024
+        if chunk_size <= 0 or limit < 1024:
+            raise StorageError("Invalid chunk size or SQLite length limit too small")
+        chunk_size = min(chunk_size, _MAX_CHUNK, limit // 2)
+        if raw_length <= 0 or len(digest) != 32:
+            raise StorageError("Invalid chunked payload length or digest")
+        raw.seek(0)
+        _validate_chunks(self.db)
         self.db.execute(
-            "UPDATE flows SET flow_id=?,timestamp=?,flow_type=?,method=?,host=?,path=?,status_code=?,request_size=?,response_size=?,payload_version=1,codec='zstd',dictionary_id=NULL,raw_length=?,payload=? WHERE sequence=?",
-            (*values, sequence),
+            _CHUNKS.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
         )
+        values = (*metadata, raw_length, digest)
+        stage = "insert" if sequence is None else "update"
+        try:
+            if sequence is None:
+                cursor = self.db.execute(
+                    "INSERT INTO flows (flow_id,timestamp,flow_type,method,host,path,status_code,request_size,response_size,payload_version,codec,dictionary_id,raw_length,payload) VALUES (?,?,?,?,?,?,?,?,?,2,'zstd-chunks',NULL,?,?)",
+                    values,
+                )
+                assert cursor.lastrowid is not None
+                sequence = cursor.lastrowid
+            else:
+                self.db.execute(
+                    "DELETE FROM flow_payload_chunks WHERE sequence=?", (sequence,)
+                )
+                cursor = self.db.execute(
+                    "UPDATE flows SET flow_id=?,timestamp=?,flow_type=?,method=?,host=?,path=?,status_code=?,request_size=?,response_size=?,payload_version=2,codec='zstd-chunks',dictionary_id=NULL,raw_length=?,payload=? WHERE sequence=?",
+                    (*values, sequence),
+                )
+                if cursor.rowcount != 1:
+                    raise StorageError("Flow not found")
+        except StorageError:
+            raise
+        except Exception as e:
+            raise StorageError(
+                f"stage=sqlite.flow.{stage} raw_length={raw_length} chunk_index=none chunk_raw_length=none compressed_length=none {_error_detail(e)}"
+            ) from None
+        hasher = hashlib.sha256()
+        remaining = raw_length
+        ordinal = 0
+        while remaining:
+            if check:
+                check()
+            data = raw.read(min(chunk_size, remaining))
+            if not data or len(data) > min(chunk_size, remaining):
+                raise StorageError("Invalid or truncated raw payload")
+            hasher.update(data)
+            try:
+                payload = zstd.compress(
+                    data,
+                    options={
+                        zstd.CompressionParameter.compression_level: 3,
+                        zstd.CompressionParameter.checksum_flag: 1,
+                    },
+                )
+            except Exception as e:
+                raise StorageError(
+                    f"stage=zstd.compress.chunk raw_length={raw_length} chunk_index={ordinal} chunk_raw_length={len(data)} compressed_length=unknown {_error_detail(e)}"
+                ) from None
+            try:
+                self.db.execute(
+                    "INSERT INTO flow_payload_chunks VALUES (?,?,?,?)",
+                    (sequence, ordinal, len(data), payload),
+                )
+            except Exception as e:
+                raise StorageError(
+                    f"stage=sqlite.chunk.insert raw_length={raw_length} chunk_index={ordinal} chunk_raw_length={len(data)} compressed_length={len(payload)} {_error_detail(e)}"
+                ) from None
+            remaining -= len(data)
+            ordinal += 1
+        if raw.read(1) or hasher.digest() != digest:
+            raise StorageError("Raw payload length or digest mismatch")
         return sequence
 
     def write(self, state: serializable.State) -> int:
-        """Return the sequence only after commit; reject a changed existing ID."""
+        """Return after commit; reject changed IDs and all existing chunked IDs."""
         flow_id = state.get("id", "unknown")
         if self._rollback_failed:
             raise StorageError(
@@ -271,6 +429,8 @@ class SQLiteFlowStore:
             ).fetchone()
             if existing:
                 sequence, *payload_fields = existing
+                if payload_fields[0] == 2:
+                    raise StorageError(f"conflicting state for flow {flow_id}")
                 if _decompress(tuple(payload_fields)) != raw:
                     raise StorageError(f"conflicting state for flow {flow_id}")
             else:
@@ -323,11 +483,18 @@ class SQLiteFlowReader:
 
     def get_flow(self, flow_id: str) -> flow.Flow | None:
         try:
+            version = self.db.execute(
+                "SELECT payload_version FROM flows WHERE flow_id=?", (flow_id,)
+            ).fetchone()
+            if version is not None and version[0] == 2:
+                raise StorageError("Chunked flow requires iter_raw")
             row = self.db.execute(
-                "SELECT payload_version,codec,dictionary_id,raw_length,payload FROM flows WHERE flow_id=?",
+                "SELECT payload_version,codec,dictionary_id,raw_length,payload FROM flows WHERE flow_id=? AND payload_version != 2",
                 (flow_id,),
             ).fetchone()
             if row is None:
+                if version is not None:
+                    raise StorageError("Flow changed; use iter_raw for chunked flows")
                 return None
             raw = _decompress(row)
             state, rest = tnetstring.pop(memoryview(raw))
@@ -342,8 +509,93 @@ class SQLiteFlowReader:
             if f.id != flow_id:
                 raise ValueError("flow ID mismatch")
             return f
+        except StorageError:
+            raise
         except Exception as e:
             raise StorageError(f"Cannot read flow {flow_id}: {type(e).__name__}") from e
+
+    def iter_raw(self, flow_id: str, *, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if self.db.in_transaction:
+            raise StorageError("Cannot stream within an existing transaction")
+        try:
+            self.db.execute("BEGIN")
+            row = self.db.execute(
+                "SELECT sequence,payload_version,codec,dictionary_id,raw_length,length(payload) FROM flows WHERE flow_id=?",
+                (flow_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("flow not found")
+            sequence, version, codec, dictionary, total, payload_size = row
+            if dictionary is not None or not isinstance(total, int) or total < 0:
+                raise ValueError("invalid payload metadata")
+            if version == 1 and codec == "zstd":
+                rows: Iterable[tuple[int, int, int]] = [(sequence, 0, total)]
+                table = "flows"
+                expected_digest = None
+            elif version == 2 and codec == "zstd-chunks" and payload_size == 32:
+                with self.db.blobopen(
+                    "flows", "payload", sequence, readonly=True
+                ) as blob:
+                    expected_digest = blob.read(32)
+                rows = self.db.execute(
+                    "SELECT rowid,ordinal,raw_length FROM flow_payload_chunks WHERE sequence=? ORDER BY ordinal",
+                    (sequence,),
+                )
+                table = "flow_payload_chunks"
+            else:
+                raise ValueError("unsupported payload format")
+            hasher = hashlib.sha256()
+            count = 0
+            ordinal = 0
+            for rowid, index, length in rows:
+                if (
+                    index != ordinal
+                    or not isinstance(length, int)
+                    or length < 0
+                    or (version == 2 and (length == 0 or length > _MAX_CHUNK))
+                ):
+                    raise ValueError("invalid chunk metadata")
+                ordinal += 1
+                decoded = 0
+                decoder = zstd.ZstdDecompressor()
+                with self.db.blobopen(table, "payload", rowid, readonly=True) as blob:
+                    while True:
+                        data = (
+                            blob.read(min(chunk_size, 65536))
+                            if decoder.needs_input
+                            else b""
+                        )
+                        if not data and decoder.needs_input:
+                            break
+                        output = decoder.decompress(
+                            data, min(chunk_size, 65536, length - decoded + 1)
+                        )
+                        decoded += len(output)
+                        if decoded > length:
+                            raise ValueError("invalid decompressed length")
+                        if output:
+                            hasher.update(output)
+                            count += len(output)
+                            yield output
+                        if decoder.eof:
+                            if decoder.unused_data or blob.tell() != len(blob):
+                                raise ValueError("trailing compressed data")
+                            break
+                if not decoder.eof or decoded != length:
+                    raise ValueError("truncated or invalid compressed payload")
+            if count != total or (
+                version == 2 and (ordinal == 0 or hasher.digest() != expected_digest)
+            ):
+                raise ValueError("payload length or digest mismatch")
+        except Exception as e:
+            raise StorageError(
+                f"Cannot stream flow {flow_id}: {type(e).__name__}: {e}"
+            ) from e
+        finally:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
 
     def newest(self, limit: int) -> list[FlowMetadata]:
         return self._page(None, limit)

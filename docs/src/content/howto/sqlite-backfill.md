@@ -55,11 +55,13 @@ which can tighten an existing database and its sidecars to mode `0600`.
 
 ## Resume and duplicate snapshots
 
-Each accepted flow is committed separately using the existing checksummed zstd
-level 3 payload format, SQLite WAL, and `synchronous=FULL`. Original IDs and native
-state are preserved. No archive-wide decompressed file or flow list is created.
-The existing `flows` schema and payload version remain unchanged; two additive
-tables hold the import manifest and per-flow backfill provenance.
+Each accepted flow is committed separately using checksummed zstd level 3,
+SQLite WAL, and `synchronous=FULL`. Original IDs and native state are preserved.
+No archive-wide decompressed file or flow list is created. Normal records retain
+the existing v1 payload format. Oversized records use the additive v2 format
+described below. The existing `flows` table definition, application ID, and schema
+version remain unchanged. Additive tables hold the manifest, backfill provenance,
+original-record identities, and v2 chunks.
 
 An indexed flow-ID lookup does not fetch the existing payload BLOB. A row without
 backfill provenance is always skipped and never overwritten, even if the archive
@@ -77,6 +79,21 @@ reported and the newer stored snapshot is retained. Identical snapshots are
 skipped, with provenance advanced when appropriate. A different state at the
 exact same registered source position is an error.
 
+Original-record SHA-256 identities allow an incomplete source to resume even if
+its records cross the v1/v2 size threshold between runs. Older v1 provenance only
+hashed reconstructed, reserialized state. When resuming such a record, the importer
+trusts its already committed position in the same verified immutable source,
+retains the existing payload unchanged, and registers its original-record identity.
+It does not reconstruct an enormous old payload merely to compare it.
+
+Duplicate matching uses either the applicable provenance digest or the original
+native-record digest. V1 provenance hashes normalized state; v2 provenance hashes
+exact native bytes. Across different source positions, equivalent states with
+different native encodings can therefore count as updates rather than duplicates.
+This preserves a complete state, not a silently truncated approximation. A later
+oversized update to a v1 row changes that ID to v2, so read it with `iter_raw()`.
+Full semantic canonicalization of oversized records is not implemented.
+
 The manifest identifies a source by canonical path, size, nanosecond modification
 and change times, device, and inode. An unchanged completed source is skipped
 without decompression. Completion is recorded only after every native record
@@ -91,29 +108,35 @@ compressed byte-offset resume or deletion of rows absent from a changed source.
 
 ## Resources, failures, and progress
 
-Decompression uses bounded chunks, but a complete individual flow must fit in
-memory. The native parser materializes a record and its state; serialization,
-compression, SQLite binding, and codec workspaces add per-flow memory. The
-importer avoids an extra flow reconstruction and periodically collects native
-reconstruction cycles so bodies do not accumulate across the archive. Declared
-native record lengths are read incrementally, without preallocating missing data
-from a corrupt length prefix. There is no benchmark-derived 16 MiB flow cap.
-Available RAM and SQLite's BLOB/record limits still apply.
+Decompression uses bounded 64 KiB buffers. Records at most 32 MiB, including
+native framing, still use `FlowReader` and v1 serialization. These records are
+materialized, so their state, serialization, compression, and SQLite workspaces
+consume several times the record size. Periodic collection prevents native
+reconstruction cycles from retaining bodies across the archive.
 
-Fixture measurements on Linux with CPython 3.14.9 and SQLite 3.54.1 used one HTTP
-flow per fresh importer process, with an incompressible response body:
+Larger records are copied incrementally into an anonymous, mode-`0600` temporary
+file in the database directory. A seek-based native scanner validates tnetstring
+structure, UTF-8, and required current-version flow fields, extracts metadata,
+and skips body bytes without materializing them. It supports version 21 HTTP,
+WebSocket, TCP, UDP, and DNS state. Oversized legacy or future versions fail
+explicitly: bounded migration is not implemented. This scanner is not a full
+replacement for all `Flow.from_state()` semantic checks. Extracted scalar metadata
+has a 1 MiB bound and nesting has a depth bound; exceeding either is an explicit
+error, not truncation. Arbitrary body bytes and uninspected metadata keys do not
+have that scalar limit.
 
-| Body size | Peak traced Python allocations | Process peak RSS |
-| --- | --- | --- |
-| 1 MiB | 4.45 MiB | 57.5 MiB |
-| 8 MiB | 32.5 MiB | 94.2 MiB |
-| 32 MiB | 128.5 MiB | 214.3 MiB |
+The spool is compressed and stored in independent zstd chunks, normally 1 MiB of
+raw bytes each. No complete oversized body, native record, or compressed payload
+is constructed in memory. Chunk sizes are also bounded by the connection's SQLite
+length limit. A forced-chunking regression uses an 8 MiB incompressible response
+and asserts peak traced Python allocations below its body size; C codec and
+SQLite allocations are not measured by that assertion. This is a bounded-buffer
+design, not a fixed process-RSS guarantee. No multi-gigabyte production import was
+run as part of validation.
 
-These are examples, not capacity guarantees. Traced allocations exclude some C
-allocations; RSS includes the interpreter/import baseline. Memory scales with
-individual flow size, not just the 64 KiB decompression chunk, and not with total
-archive size. Large native records may require several times their body size in
-RAM. No multi-gigabyte production archive was imported for these measurements.
+Declared native lengths are checked without preallocating missing data. There is
+no 16 MiB rejection limit, and the oversized format does not depend on raising
+SQLite's ordinary single-BLOB limit.
 
 Disk checks run before opening the database, during compressed reads, before
 payload writes, and before marking a source complete. The reserve is 64 MiB plus
@@ -126,24 +149,77 @@ fail explicitly. The target is never recreated, truncated, or vacuumed.
 The target's parent directory must already exist, be owned by the current user
 or root, and not be group/world-writable. The directory chain must pass the storage
 layer's trusted-directory checks. Database and sidecar files use restrictive
-permissions. No decompressed temporary files are used, and source archives are
-opened only for reading.
+permissions. A decompressed temporary file exists only for the current oversized
+record, never for the whole archive. It is unlinked automatically, including on
+failure or interruption. Source archives are opened only for reading.
 
 Progress reports include compressed bytes read within the current archive,
 cumulative bytes, and committed flow counts about every two seconds while work
-advances. A long individual parse/compression/commit can delay a report. The final
+advances. Oversized spooling and chunk writes also check interruption and report
+progress. Metadata scanning or a slow commit can delay a report. The final
 summary includes archives found/completed/skipped/failed, inserted and existing
 flows, updated snapshots, newer snapshots retained, conflicts, bytes read, and
 database size including any remaining WAL/SHM files. A manifest skip reads zero
 compressed bytes. Captured bodies, headers, and parser exception contents are not
 logged.
 
-Ctrl+C stops after the current transaction, preserves committed data, closes the
-database, and exits `130`. Invalid arguments exit `2`; archive, storage, and disk
-errors exit `1`. Success exits `0`. Errors identify the database and current source
+Ctrl+C preserves committed data, closes the database, and exits `130`. An
+interrupted oversized write rolls back its entire transaction, including its row,
+chunks, and provenance. Normal small-flow transactions finish before stopping.
+Invalid arguments exit `2`; archive, storage, and disk errors exit `1`. Success
+exits `0`. Errors identify the database and current source
 archive. Repair an invalid source or resolve a storage problem, then rerun; a
 failed archive is never silently marked complete. The tool stops at the first
-failure rather than skipping unreadable records.
+failure rather than skipping unreadable records. Per-record failures include a
+safe stage, zero-based record ordinal, lengths when known, and exception type.
+Compression and SQLite binding failures identify their operation separately.
+
+## Chunked format and complete incremental export
+
+A v2 `flows` row has `payload_version=2`, `codec='zstd-chunks'`, no dictionary,
+the total native byte length, and a 32-byte SHA-256 in `payload`. Its ordered
+`flow_payload_chunks` rows hold raw lengths and independent checksummed zstd
+frames. The row, chunks, metadata, and provenance publish in one transaction;
+readers cannot see a partially committed flow. Failed updates restore the old
+payload and chunks. No separate staging rows or orphan chunks are published.
+
+`SQLiteFlowReader.get_flow()` retains its existing v1 behavior. It explicitly
+rejects v2 and directs callers to `iter_raw(flow_id)`, rather than allocating an
+enormous `Flow` or substituting missing bodies. `iter_raw()` works for both formats
+and yields at most 64 KiB at a time under one consistent read transaction. For v2,
+the output is the exact original native record, including its framing. For v1,
+it is the native state stored by the existing serializer. The iterator verifies
+chunk order, checksums, lengths, and the v2 whole-record digest.
+
+Consume the iterator completely to establish integrity. It can yield a prefix
+before detecting later corruption. Export to a private partial file and publish
+it only after iteration succeeds, for example:
+
+```python
+import os
+from pathlib import Path
+
+from mitmproxy.io.sqlite import SQLiteFlowReader
+
+target = Path("exported-flow.mitm")
+partial = target.with_suffix(".mitm.partial")
+with SQLiteFlowReader(Path.home() / ".mitmproxy/flows.sqlite3") as reader:
+    with os.fdopen(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as out:
+        for chunk in reader.iter_raw(flow_id):
+            out.write(chunk)
+partial.replace(target)
+```
+
+On failure, the example deliberately leaves the `.partial` file unpublished.
+Close an abandoned iterator explicitly to release its read transaction; long
+exports can retain WAL pages while another connection writes. Do not join the
+iterator into a single bytes object or pass a multi-gigabyte export to the ordinary
+in-memory `FlowReader` if bounded memory is required.
+
+Old binaries do not understand v2 and must not read or write databases containing
+those rows. The ordinary live SQLite writer also explicitly reports a conflict for an existing v2
+ID, even for a logically identical state; it never overwrites the chunked record.
+This does not change v1 duplicate handling or enable chunking in live recording.
 
 ## Ordering for future historical browsing
 

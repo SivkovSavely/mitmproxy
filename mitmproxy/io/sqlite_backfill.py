@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 from typing import Literal
 
 from mitmproxy import flow
@@ -75,6 +76,9 @@ _PROVENANCE = """CREATE TABLE backfill_provenance (
     path TEXT NOT NULL, revision INTEGER NOT NULL, ordinal INTEGER NOT NULL,
     digest BLOB NOT NULL
 )"""
+_NATIVE_IDENTITY = """CREATE TABLE backfill_native_identity (
+    flow_id TEXT PRIMARY KEY, digest BLOB NOT NULL
+)"""
 
 
 class SQLiteBackfillStore(SQLiteFlowStore):
@@ -85,6 +89,11 @@ class SQLiteBackfillStore(SQLiteFlowStore):
                 if not self.check_schema(self.db):
                     self.db.execute(_MANIFEST)
                     self.db.execute(_PROVENANCE)
+                self.db.execute(
+                    _NATIVE_IDENTITY.replace(
+                        "CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1
+                    )
+                )
         except Exception:
             self.close()
             raise
@@ -100,27 +109,52 @@ class SQLiteBackfillStore(SQLiteFlowStore):
             "backfill_provenance": _PROVENANCE,
         }:
             raise StorageError("Incompatible backfill schema")
+        identity = db.execute(
+            "SELECT sql FROM sqlite_master WHERE name='backfill_native_identity'"
+        ).fetchone()
+        if identity and (not rows or identity[0] != _NATIVE_IDENTITY):
+            raise StorageError("Incompatible native provenance schema")
         return bool(rows)
 
     @contextmanager
-    def _transaction(self) -> Iterator[None]:
+    def _transaction(
+        self,
+        operation: str = "transaction",
+        ordinal: int | None = None,
+        raw_length: int | None = None,
+    ) -> Iterator[None]:
         if self._rollback_failed:
             raise StorageError("Previous rollback failed; close store")
+        stage = "begin"
         try:
             self.db.execute("BEGIN IMMEDIATE")
+            stage = operation
             yield
+            stage = "commit"
             self.db.execute("COMMIT")
-        except Exception as e:
+        except BaseException as e:
             if self.db.in_transaction:
                 try:
                     self.db.execute("ROLLBACK")
                 except sqlite3.Error as rollback_error:
                     self._rollback_failed = True
                     raise StorageError("Backfill rollback failed") from rollback_error
-            if isinstance(e, StorageError):
+            if not isinstance(e, Exception):
                 raise
-            detail = str(e) if isinstance(e, sqlite3.Error) else type(e).__name__
-            raise StorageError(f"Backfill transaction failed: {detail}") from None
+            detail = type(e).__name__
+            if isinstance(e, StorageError):
+                detail += f": {e}"
+            elif isinstance(e, sqlite3.Error):
+                detail += f" {getattr(e, 'sqlite_errorname', '')}"
+                if str(e) in (
+                    "disk full",
+                    "database or disk is full",
+                    "database is locked",
+                ):
+                    detail += f" {e}"
+            raise StorageError(
+                f"Backfill transaction failed stage={stage} ordinal={ordinal} raw_length={raw_length}: {detail}"
+            ) from None
 
     @staticmethod
     def _fingerprint(source: Source) -> tuple:
@@ -167,52 +201,133 @@ class SQLiteBackfillStore(SQLiteFlowStore):
         ordinal: int,
         *,
         check_space: Callable[[int], None] | None = None,
+        native_digest: bytes | None = None,
     ) -> ImportResult:
-        with self._transaction():
+        with self._transaction("write_flow", ordinal):
             self._registered(source, revision)
-            row = self.db.execute(
-                "SELECT flows.sequence,backfill_provenance.timestamp,backfill_provenance.suffix,backfill_provenance.path,backfill_provenance.revision,backfill_provenance.ordinal,backfill_provenance.digest FROM flows LEFT JOIN backfill_provenance ON flows.flow_id=backfill_provenance.flow_id WHERE flows.flow_id=?",
-                (f.id,),
-            ).fetchone()
+            row = self._previous(f.id)
             if row and row[1] is None:
                 return ImportResult("existing")
             raw = tnetstring.dumps(f.get_state())
             digest = hashlib.sha256(raw).digest()
-            order = (source.timestamp, source.suffix, source.path, revision, ordinal)
-            if row:
-                previous = row[1:6]
-                if order == previous and digest != row[6]:
-                    raise StorageError("Conflicting state at same source position")
-                if order <= previous:
-                    return ImportResult(
-                        "existing" if digest == row[6] else "retained", digest != row[6]
-                    )
-                if digest == row[6]:
-                    status: Literal["inserted", "existing", "updated", "retained"] = (
-                        "existing"
-                    )
-                else:
-                    status = "updated"
-            else:
-                status = "inserted"
-            if status != "existing":
-                if check_space:
-                    # Freeing an old large BLOB can dirty its pages in the WAL.
-                    old_size = (
-                        self.db.execute(
-                            "SELECT length(payload) FROM flows WHERE sequence=?",
-                            (row[0],),
-                        ).fetchone()[0]
-                        if row
-                        else 0
-                    )
-                    check_space(max(len(raw), old_size))
-                self._write_payload(f, raw, row[0] if row else None)
-            self.db.execute(
-                "INSERT INTO backfill_provenance VALUES (?,?,?,?,?,?,?) ON CONFLICT(flow_id) DO UPDATE SET timestamp=excluded.timestamp,suffix=excluded.suffix,path=excluded.path,revision=excluded.revision,ordinal=excluded.ordinal,digest=excluded.digest",
-                (f.id, *order, digest),
+            return self._publish(
+                f.id,
+                digest,
+                native_digest,
+                source,
+                revision,
+                ordinal,
+                row,
+                len(raw),
+                lambda sequence: self._write_payload(f, raw, sequence),
+                check_space,
             )
-            return ImportResult(status, status == "updated")
+
+    def write_raw(
+        self,
+        metadata: tuple,
+        raw: BinaryIO,
+        raw_length: int,
+        digest: bytes,
+        source: Source,
+        revision: int,
+        ordinal: int,
+        *,
+        chunk_size: int = 1024 * 1024,
+        check_space: Callable[[int], None] | None = None,
+        check: Callable[[], None] | None = None,
+        resume_legacy: bool = False,
+    ) -> ImportResult:
+        """Publish an exact native record and its provenance in one transaction.
+
+        resume_legacy trusts a previously committed v1 source position. Only use
+        it after reading that ordinal from the same verified, immutable source:
+        older importers hashed normalized state, not the original native bytes.
+        """
+        with self._transaction("write_raw", ordinal, raw_length):
+            self._registered(source, revision)
+            row = self._previous(metadata[0])
+            if row and row[1] is None:
+                return ImportResult("existing")
+            return self._publish(
+                metadata[0],
+                digest,
+                digest,
+                source,
+                revision,
+                ordinal,
+                row,
+                raw_length,
+                lambda sequence: self._write_chunked(
+                    metadata,
+                    raw,
+                    raw_length,
+                    digest,
+                    sequence,
+                    chunk_size=chunk_size,
+                    check=check,
+                ),
+                check_space,
+                resume_legacy=resume_legacy,
+            )
+
+    def _previous(self, flow_id: str) -> tuple | None:
+        return self.db.execute(
+            "SELECT flows.sequence,p.timestamp,p.suffix,p.path,p.revision,p.ordinal,p.digest,n.digest,flows.payload_version FROM flows LEFT JOIN backfill_provenance p ON flows.flow_id=p.flow_id LEFT JOIN backfill_native_identity n ON flows.flow_id=n.flow_id WHERE flows.flow_id=?",
+            (flow_id,),
+        ).fetchone()
+
+    def _publish(
+        self,
+        flow_id: str,
+        digest: bytes,
+        native_digest: bytes | None,
+        source: Source,
+        revision: int,
+        ordinal: int,
+        row: tuple | None,
+        raw_length: int,
+        write: Callable[[int | None], int],
+        check_space: Callable[[int], None] | None,
+        *,
+        resume_legacy: bool = False,
+    ) -> ImportResult:
+        order = (source.timestamp, source.suffix, source.path, revision, ordinal)
+        status: Literal["inserted", "existing", "updated", "retained"] = "inserted"
+        if row:
+            same = digest == row[6] or (
+                native_digest is not None and native_digest == row[7]
+            )
+            if resume_legacy and order == row[1:6] and row[7] is None and row[8] == 1:
+                same = True
+            if order == row[1:6] and not same:
+                raise StorageError("Conflicting state at same source position")
+            if order <= row[1:6]:
+                if same and order == row[1:6] and native_digest is not None:
+                    self.db.execute(
+                        "INSERT INTO backfill_native_identity VALUES (?,?) ON CONFLICT(flow_id) DO UPDATE SET digest=excluded.digest",
+                        (flow_id, native_digest),
+                    )
+                return ImportResult("existing" if same else "retained", not same)
+            status = "existing" if same else "updated"
+        if status != "existing":
+            if check_space:
+                check_space(max(raw_length, self._stored_size(row[0]) if row else 0))
+            write(row[0] if row else None)
+        self.db.execute(
+            "INSERT INTO backfill_provenance VALUES (?,?,?,?,?,?,?) ON CONFLICT(flow_id) DO UPDATE SET timestamp=excluded.timestamp,suffix=excluded.suffix,path=excluded.path,revision=excluded.revision,ordinal=excluded.ordinal,digest=excluded.digest",
+            (flow_id, *order, digest),
+        )
+        if native_digest is None:
+            self.db.execute(
+                "DELETE FROM backfill_native_identity WHERE flow_id=?", (flow_id,)
+            )
+        else:
+            self.db.execute(
+                "INSERT INTO backfill_native_identity VALUES (?,?) ON CONFLICT(flow_id) DO UPDATE SET digest=excluded.digest",
+                (flow_id, native_digest),
+            )
+        return ImportResult(status, status == "updated")
 
     def finish_source(self, source: Source, revision: int, flow_count: int) -> None:
         with self._transaction():

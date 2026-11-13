@@ -7,6 +7,7 @@ docs/src/content/howto/sqlite-backfill.md for ordering and resource limits.
 
 import argparse
 import gc
+import hashlib
 import io
 import os
 import re
@@ -15,6 +16,7 @@ import signal
 import sqlite3
 import stat
 import sys
+import tempfile
 import time
 from contextlib import closing
 from dataclasses import dataclass
@@ -23,6 +25,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from mitmproxy.io import FlowReader
+from mitmproxy.io import sqlite_native
 from mitmproxy.io.sqlite import _secure_directory
 from mitmproxy.io.sqlite import _secure_path
 from mitmproxy.io.sqlite import _validate
@@ -35,10 +38,11 @@ _FILENAME = re.compile(r"flows-(\d{4}-\d{2}-\d{2}_\d{2})\.mitm(?:-([1-9]\d*))?\.
 _REPORT_SECONDS = 2
 _RESERVE_BYTES = 64 * 1024 * 1024
 _CHUNK_BYTES = 64 * 1024
-_GC_BYTES = 4 * 1024 * 1024
+_GC_BYTES = 1024 * 1024
+_INLINE_BYTES = 32 * 1024 * 1024
 
 
-class _Interrupted(Exception):
+class _Interrupted(BaseException):
     pass
 
 
@@ -233,9 +237,27 @@ class _NativeStream(io.BufferedReader):
         return output.getvalue()
 
 
+def _record_prefix(stream: BinaryIO) -> bytes:
+    prefix = bytearray()
+    while True:
+        char = stream.read(1)
+        if not char and not prefix:
+            return b""
+        if char == b":" and prefix:
+            return bytes(prefix) + char
+        if not char or not b"0" <= char <= b"9" or len(prefix) >= 12:
+            raise ValueError("Invalid native length prefix")
+        prefix.extend(char)
+
+
 def _import_archive(
     archive: Archive, store: SQLiteBackfillStore, progress: _Progress, database: Path
 ) -> None:
+    def check_write() -> None:
+        progress.check_interrupted()
+        _check_space(database)
+        progress.report()
+
     progress.check_interrupted()
     progress.archive = archive.path
     progress.archive_bytes = 0
@@ -257,25 +279,78 @@ def _import_archive(
         flow_count = 0
         collected_at = 0
         with _NativeStream(decoder) as stream:
-            # FlowReader also accepts HAR, which reads the entire input at once.
-            prefix = stream.peek(1)[:1]
-            if prefix and not prefix.isdigit():
-                raise StorageError("Invalid native flow stream (HAR is not supported)")
-            for f in FlowReader(stream).stream():
-                progress.check_interrupted()
-                result = store.write_flow(
-                    f,
-                    source,
-                    revision,
-                    flow_count,
-                    check_space=lambda size: _check_space(database, size),
-                )
+            while True:
+                stage = "native.prefix"
+                raw_length = None
+                try:
+                    prefix = _record_prefix(stream)
+                    if not prefix:
+                        break
+                    remaining = int(prefix[:-1]) + 1
+                    raw_length = len(prefix) + remaining
+                    progress.check_interrupted()
+                    if raw_length <= _INLINE_BYTES:
+                        stage = "native.decode"
+                        raw = prefix + stream.read(remaining)
+                        if len(raw) != raw_length:
+                            raise EOFError
+                        flows = iter(FlowReader(io.BytesIO(raw)).stream())
+                        f = next(flows)
+                        if next(flows, None) is not None:
+                            raise ValueError("More than one native flow")
+                        stage = "write_flow"
+                        result = store.write_flow(
+                            f,
+                            source,
+                            revision,
+                            flow_count,
+                            check_space=lambda size: _check_space(database, size),
+                            native_digest=hashlib.sha256(raw).digest(),
+                        )
+                        del f, raw, flows
+                    else:
+                        stage = "native.spool"
+                        _check_space(database, raw_length)
+                        with tempfile.TemporaryFile(
+                            prefix="sqlite-backfill-", dir=database.parent
+                        ) as record:
+                            record.write(prefix)
+                            digest = hashlib.sha256(prefix)
+                            while remaining:
+                                progress.check_interrupted()
+                                chunk = stream.read(min(remaining, _CHUNK_BYTES))
+                                if not chunk:
+                                    raise EOFError
+                                record.write(chunk)
+                                digest.update(chunk)
+                                remaining -= len(chunk)
+                            record.flush()
+                            stage = "native.metadata"
+                            metadata = sqlite_native.metadata(record, raw_length)
+                            progress.check_interrupted()
+                            stage = "write_raw"
+                            result = store.write_raw(
+                                metadata,
+                                record,
+                                raw_length,
+                                digest.digest(),
+                                source,
+                                revision,
+                                flow_count,
+                                check_space=lambda size: _check_space(database, size),
+                                check=check_write,
+                                resume_legacy=True,
+                            )
+                except Exception as e:
+                    detail = str(e) if isinstance(e, StorageError) else type(e).__name__
+                    raise StorageError(
+                        f"Invalid compressed/native flow data stage={stage} ordinal={flow_count} raw_length={raw_length}: {detail}"
+                    ) from None
                 flow_count += 1
                 progress.flows += 1
                 setattr(progress, result.status, getattr(progress, result.status) + 1)
                 progress.conflicts += int(result.conflicting)
                 progress.report()
-                del f
                 # Native reconstruction can leave exception/frame cycles holding bodies.
                 if decoder.decoded_bytes - collected_at >= _GC_BYTES:
                     gc.collect()

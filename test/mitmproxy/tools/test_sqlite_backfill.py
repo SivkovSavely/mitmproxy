@@ -10,6 +10,7 @@ from contextlib import closing
 import pytest
 
 from mitmproxy import http
+from mitmproxy.io import FlowReader
 from mitmproxy.io import FlowWriter
 from mitmproxy.io.sqlite import SQLiteFlowReader
 from mitmproxy.io.sqlite import SQLiteFlowStore
@@ -542,12 +543,39 @@ def test_sqlite_locked_preserves_existing_flow(tmp_path, monkeypatch, capsys):
 
 def test_parser_must_consume_and_verify_full_stream(tmp_path, monkeypatch, capsys):
     archive(tmp_path, [tflow.tflow()])
-    monkeypatch.setattr(backfill.FlowReader, "stream", lambda reader: iter(()))
+    monkeypatch.setattr(backfill, "_record_prefix", lambda stream: b"")
     assert backfill.main(arguments(tmp_path)) == 1
     assert "EOF was not verified" in capsys.readouterr().err
     with closing(sqlite3.connect(tmp_path / "flows.sqlite3")) as db:
         assert db.execute("SELECT complete FROM backfill_manifest").fetchall() == [(0,)]
         assert db.execute("SELECT count(*) FROM flows").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_inline_parser_requires_exactly_one_flow(tmp_path, monkeypatch, capsys, count):
+    f = tflow.tflow()
+    archive(tmp_path, [f])
+    monkeypatch.setattr(backfill.FlowReader, "stream", lambda reader: iter([f] * count))
+    assert backfill.main(arguments(tmp_path)) == 1
+    assert "stage=native.decode ordinal=0" in capsys.readouterr().err
+    with SQLiteFlowReader(tmp_path / "flows.sqlite3") as reader:
+        assert reader.newest(1) == []
+
+
+def test_native_stream_large_short_read_does_not_preallocate():
+    with backfill._NativeStream(io.BytesIO(b"short")) as stream:
+        assert stream.read(100000000) == b"short"
+
+
+def test_unexpected_preflight_error_reports_only_type(tmp_path, monkeypatch, capsys):
+    def fail(*args):
+        raise ValueError("private-captured-data")
+
+    monkeypatch.setattr(backfill, "_preflight", fail)
+    assert backfill.main(arguments(tmp_path)) == 1
+    error = capsys.readouterr().err
+    assert "ValueError" in error
+    assert "private-captured-data" not in error
 
 
 def test_ctrl_c_between_final_check_and_handler_restoration(
@@ -567,3 +595,171 @@ def test_ctrl_c_between_final_check_and_handler_restoration(
     monkeypatch.setattr(signal, "signal", install)
     assert backfill.main(arguments(tmp_path)) == 130
     assert "Interrupted" in capsys.readouterr().err
+
+
+def test_oversized_native_exact_export_resume_and_skip(tmp_path, monkeypatch, capsys):
+    first, large, last = tflow.tflow(), tflow.tflow(resp=True), tflow.ttcpflow()
+    large.response.raw_content = os.urandom(256 * 1024)
+    large.comment = "preserved"
+    large.backup()
+    path = archive(tmp_path, [first, large, last])
+    original = hashlib.sha256(path.read_bytes()).digest()
+    monkeypatch.setattr(backfill, "_INLINE_BYTES", 4096, raising=False)
+    assert backfill.main(arguments(tmp_path)) == 0
+    database = tmp_path / "flows.sqlite3"
+    with SQLiteFlowReader(database) as reader:
+        assert reader.get_flow(first.id).get_state() == first.get_state()
+        with pytest.raises(backfill.StorageError, match="iter_raw"):
+            reader.get_flow(large.id)
+        chunks = list(reader.iter_raw(large.id, chunk_size=1024))
+        assert max(map(len, chunks)) <= 1024
+        assert b"".join(chunks) == native(large)
+        restored = next(FlowReader(io.BytesIO(b"".join(chunks))).stream())
+        assert restored.id == large.id
+        assert restored.response.raw_content == large.response.raw_content
+        row = next(row for row in reader.newest(10) if row.flow_id == large.id)
+        assert row.response_size == len(large.response.raw_content)
+    with closing(sqlite3.connect(database)) as db:
+        assert db.execute(
+            "SELECT complete,flow_count FROM backfill_manifest"
+        ).fetchall() == [(1, 3)]
+        assert db.execute("SELECT count(*) FROM backfill_provenance").fetchone()[0] == 3
+    assert backfill.main(arguments(tmp_path)) == 0
+    assert "skipped=1" in capsys.readouterr().out
+    assert hashlib.sha256(path.read_bytes()).digest() == original
+
+
+@pytest.mark.parametrize("phase", ["spool", "chunks"])
+def test_oversized_interrupt_rolls_back_and_resumes(tmp_path, monkeypatch, phase):
+    first, large = tflow.tflow(), tflow.tflow(resp=True)
+    large.response.raw_content = os.urandom(256 * 1024)
+    archive(tmp_path, [first, large])
+    monkeypatch.setattr(backfill, "_INLINE_BYTES", 4096, raising=False)
+    database = tmp_path / "flows.sqlite3"
+    with monkeypatch.context() as patch:
+        if phase == "spool":
+            read = backfill._NativeStream.read
+
+            def interrupted_read(stream, size=-1):
+                result = read(stream, size)
+                if size == backfill._CHUNK_BYTES:
+                    raise backfill._Interrupted
+                return result
+
+            patch.setattr(backfill._NativeStream, "read", interrupted_read)
+        else:
+            write = SQLiteFlowStore._write_chunked
+
+            def interrupted_write(store, *args, **kwargs):
+                write(store, *args, **kwargs)
+                assert store.db.in_transaction
+                raise backfill._Interrupted
+
+            patch.setattr(SQLiteFlowStore, "_write_chunked", interrupted_write)
+        assert backfill.main(arguments(tmp_path)) == 130
+    with SQLiteFlowReader(database) as reader:
+        assert reader.get_flow(first.id)
+        assert reader.get_flow(large.id) is None
+    with closing(sqlite3.connect(database)) as db:
+        assert db.execute("SELECT complete FROM backfill_manifest").fetchall() == [(0,)]
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='flow_payload_chunks'"
+        ).fetchone():
+            assert (
+                db.execute("SELECT count(*) FROM flow_payload_chunks").fetchone()[0]
+                == 0
+            )
+    assert backfill.main(arguments(tmp_path)) == 0
+    with SQLiteFlowReader(database) as reader:
+        assert b"".join(reader.iter_raw(large.id)) == native(large)
+    assert not list(tmp_path.glob("sqlite-backfill-*"))
+
+
+def test_oversized_corrupt_native_is_not_published(tmp_path, monkeypatch, capsys):
+    large = tflow.tflow(resp=True)
+    large.response.raw_content = b"private-captured-body" * 4096
+    raw = native(large)
+    archive(tmp_path, raw=raw[:-1] + b"x")
+    monkeypatch.setattr(backfill, "_INLINE_BYTES", 4096, raising=False)
+    assert backfill.main(arguments(tmp_path)) == 1
+    error = capsys.readouterr().err
+    assert "ordinal=0" in error
+    assert "raw_length=" in error
+    assert "private-captured-body" not in error
+    with closing(sqlite3.connect(tmp_path / "flows.sqlite3")) as db:
+        assert db.execute("SELECT count(*) FROM flows").fetchone()[0] == 0
+        assert db.execute("SELECT complete FROM backfill_manifest").fetchall() == [(0,)]
+
+
+def test_oversized_import_does_not_materialize_native_body(tmp_path, monkeypatch):
+    large = tflow.tflow(resp=True)
+    large.response.raw_content = os.urandom(8 * 1024 * 1024)
+    archive(tmp_path, [large])
+    monkeypatch.setattr(backfill, "_INLINE_BYTES", 4096, raising=False)
+
+    def materialized(*args):
+        pytest.fail("oversized record reached FlowReader")
+
+    monkeypatch.setattr(backfill.FlowReader, "stream", materialized)
+    tracemalloc.start()
+    try:
+        assert backfill.main(arguments(tmp_path)) == 0
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < len(large.response.raw_content)
+
+
+@pytest.mark.parametrize(
+    "first_chunked,legacy", [(False, False), (False, True), (True, False)]
+)
+def test_resume_same_archive_across_payload_formats(
+    tmp_path, monkeypatch, first_chunked, legacy
+):
+    first, last = tflow.tflow(resp=True), tflow.ttcpflow()
+    first.response.raw_content = os.urandom(8192)
+    original = b"0" + native(first)
+    archive(tmp_path, raw=original + native(last))
+    database = tmp_path / "flows.sqlite3"
+    with monkeypatch.context() as patch:
+        patch.setattr(backfill, "_INLINE_BYTES", 4096 if first_chunked else 1024 * 1024)
+        method = "write_raw" if first_chunked else "write_flow"
+        write = getattr(backfill.SQLiteBackfillStore, method)
+
+        def stop_after_commit(store, *args, **kwargs):
+            write(store, *args, **kwargs)
+            raise backfill._Interrupted
+
+        patch.setattr(backfill.SQLiteBackfillStore, method, stop_after_commit)
+        assert backfill.main(arguments(tmp_path)) == 130
+    with closing(sqlite3.connect(database)) as db:
+        before = db.execute(
+            "SELECT sequence,payload_version,payload FROM flows"
+        ).fetchone()
+        assert before[1] == (2 if first_chunked else 1)
+        if legacy:
+            db.execute("DROP TABLE backfill_native_identity")
+            db.commit()
+    monkeypatch.setattr(
+        backfill, "_INLINE_BYTES", 1024 * 1024 if first_chunked else 4096
+    )
+    assert backfill.main(arguments(tmp_path)) == 0
+    with closing(sqlite3.connect(database)) as db:
+        assert (
+            db.execute(
+                "SELECT sequence,payload_version,payload FROM flows WHERE flow_id=?",
+                (first.id,),
+            ).fetchone()
+            == before
+        )
+        assert db.execute(
+            "SELECT complete,flow_count FROM backfill_manifest"
+        ).fetchall() == [(1, 2)]
+        assert db.execute("SELECT count(*) FROM flows").fetchone()[0] == 2
+        assert db.execute(
+            "SELECT ordinal FROM backfill_provenance WHERE flow_id=?", (first.id,)
+        ).fetchone() == (0,)
+    with SQLiteFlowReader(database) as reader:
+        expected = original if first_chunked else native(first)
+        assert b"".join(reader.iter_raw(first.id)) == expected
+        assert reader.get_flow(last.id).get_state() == last.get_state()

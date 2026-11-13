@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import io
 import os
 import sqlite3
 import threading
@@ -9,6 +11,433 @@ import pytest
 
 from mitmproxy.io import sqlite
 from mitmproxy.test import tflow
+
+
+def test_chunked_roundtrip_and_v1_stream(tmp_path):
+    path = tmp_path / "db"
+    first, second = tflow.tflow(), tflow.tflow()
+    raw = sqlite.tnetstring.dumps(second.get_state())
+    with sqlite.SQLiteFlowStore(path) as store:
+        store.write(first.get_state())
+        store.db.execute("BEGIN IMMEDIATE")
+        sequence = store._write_chunked(
+            sqlite._metadata(second),
+            io.BytesIO(raw),
+            len(raw),
+            hashlib.sha256(raw).digest(),
+            chunk_size=100,
+        )
+        store.db.execute("COMMIT")
+        assert store._stored_size(sequence) > 32
+        with sqlite.SQLiteFlowReader(path) as reader:
+            assert b"".join(
+                reader.iter_raw(first.id, chunk_size=7)
+            ) == sqlite.tnetstring.dumps(first.get_state())
+            assert b"".join(reader.iter_raw(second.id, chunk_size=7)) == raw
+            with pytest.raises(sqlite.StorageError, match="iter_raw"):
+                reader.get_flow(second.id)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["missing", "reorder", "digest", "truncated", "trailing", "version", "length"],
+)
+def test_chunked_corruption(tmp_path, damage):
+    path = tmp_path / "db"
+    f = tflow.tflow()
+    raw = sqlite.tnetstring.dumps(f.get_state())
+    with sqlite.SQLiteFlowStore(path) as store:
+        store.db.execute("BEGIN IMMEDIATE")
+        store._write_chunked(
+            sqlite._metadata(f),
+            io.BytesIO(raw),
+            len(raw),
+            hashlib.sha256(raw).digest(),
+            chunk_size=100,
+        )
+        store.db.execute("COMMIT")
+        if damage == "missing":
+            store.db.execute("DELETE FROM flow_payload_chunks WHERE ordinal=1")
+        elif damage == "reorder":
+            store.db.execute(
+                "UPDATE flow_payload_chunks SET ordinal=1000 WHERE ordinal=0"
+            )
+        elif damage == "digest":
+            store.db.execute("UPDATE flows SET payload=zeroblob(32)")
+        elif damage == "version":
+            store.db.execute("UPDATE flows SET codec='unknown'")
+        elif damage == "length":
+            store.db.execute(
+                "UPDATE flow_payload_chunks SET raw_length=raw_length+1 WHERE ordinal=0"
+            )
+        elif damage == "truncated":
+            store.db.execute(
+                "UPDATE flow_payload_chunks SET payload=substr(payload,1,length(payload)-1) WHERE ordinal=0"
+            )
+        else:
+            store.db.execute(
+                "UPDATE flow_payload_chunks SET payload=CAST(payload || x'00' AS BLOB) WHERE ordinal=0"
+            )
+        with sqlite.SQLiteFlowReader(path) as reader:
+            with pytest.raises(sqlite.StorageError):
+                b"".join(reader.iter_raw(f.id))
+
+
+def test_chunked_rollback_and_snapshot(tmp_path):
+    path = tmp_path / "db"
+    f = tflow.tflow()
+    raw = sqlite.tnetstring.dumps(f.get_state())
+    digest = hashlib.sha256(raw).digest()
+    with sqlite.SQLiteFlowStore(path) as store:
+        store.db.execute("BEGIN IMMEDIATE")
+
+        def interrupt():
+            raise RuntimeError("interrupted")
+
+        with pytest.raises(RuntimeError):
+            store._write_chunked(
+                sqlite._metadata(f),
+                io.BytesIO(raw),
+                len(raw),
+                digest,
+                chunk_size=100,
+                check=interrupt,
+            )
+        store.db.execute("ROLLBACK")
+        assert not store.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='flow_payload_chunks'"
+        ).fetchone()
+        store.db.execute("BEGIN IMMEDIATE")
+        sequence = store._write_chunked(
+            sqlite._metadata(f), io.BytesIO(raw), len(raw), digest, chunk_size=100
+        )
+        store.db.execute("COMMIT")
+        with sqlite.SQLiteFlowReader(path) as reader:
+            stream = reader.iter_raw(f.id, chunk_size=10)
+            first = next(stream)
+            f.comment = "new"
+            store.db.execute("BEGIN IMMEDIATE")
+            store._write_payload(f, sqlite.tnetstring.dumps(f.get_state()), sequence)
+            store.db.execute("COMMIT")
+            assert first + b"".join(stream) == raw
+            assert (
+                store.db.execute("SELECT count(*) FROM flow_payload_chunks").fetchone()[
+                    0
+                ]
+                == 0
+            )
+            with pytest.raises(sqlite.StorageError):
+                list(reader.iter_raw("missing"))
+
+
+def test_foreign_chunk_schema_rejected(tmp_path):
+    path = tmp_path / "db"
+    with sqlite.SQLiteFlowStore(path) as store:
+        store.db.execute("CREATE TABLE flow_payload_chunks (wrong)")
+    with pytest.raises(sqlite.StorageError, match="schema"):
+        sqlite.SQLiteFlowReader(path)
+
+
+def test_chunked_validation_and_update_rollback(tmp_path):
+    path = tmp_path / "db"
+    f = tflow.tflow()
+    raw = sqlite.tnetstring.dumps(f.get_state())
+    digest = hashlib.sha256(raw).digest()
+    with sqlite.SQLiteFlowStore(path) as store:
+        sequence = store.write(f.get_state())
+        assert store._stored_size(sequence) > 0
+        with pytest.raises(sqlite.StorageError):
+            store._stored_size(999)
+        with pytest.raises(sqlite.StorageError, match="transaction"):
+            store._write_chunked(sqlite._metadata(f), io.BytesIO(raw), len(raw), digest)
+        store.db.execute("BEGIN IMMEDIATE")
+        for data, length, expected, size in [
+            (raw, len(raw), digest, 0),
+            (raw, 0, digest, 100),
+            (raw[:-1], len(raw), digest, 100),
+            (raw + b"x", len(raw), digest, 100),
+            (raw, len(raw), bytes(32), 100),
+        ]:
+            with pytest.raises(sqlite.StorageError):
+                store._write_chunked(
+                    sqlite._metadata(f),
+                    io.BytesIO(data),
+                    length,
+                    expected,
+                    sequence,
+                    chunk_size=size,
+                )
+        store.db.execute("ROLLBACK")
+        with sqlite.SQLiteFlowReader(path) as reader:
+            assert b"".join(reader.iter_raw(f.id)) == raw
+        store.db.execute("BEGIN IMMEDIATE")
+        store._write_chunked(
+            sqlite._metadata(f),
+            io.BytesIO(raw),
+            len(raw),
+            digest,
+            sequence,
+            chunk_size=100,
+        )
+        store.db.execute("COMMIT")
+        with pytest.raises(sqlite.StorageError, match="conflict"):
+            store.write(f.get_state())
+        with sqlite.SQLiteFlowReader(path) as reader:
+            stream = reader.iter_raw(f.id, chunk_size=1)
+            next(stream)
+            with pytest.raises(sqlite.StorageError, match="transaction"):
+                next(reader.iter_raw(f.id))
+            stream.close()
+            assert not reader.db.in_transaction
+            with pytest.raises(ValueError):
+                next(reader.iter_raw(f.id, chunk_size=0))
+
+
+def test_compress_diagnostic_hides_error_data(tmp_path, monkeypatch):
+    with sqlite.SQLiteFlowStore(tmp_path / "db") as store:
+
+        def fail(*args, **kwargs):
+            raise ValueError("sensitive payload")
+
+        monkeypatch.setattr(sqlite.zstd, "compress", fail)
+        with pytest.raises(sqlite.StorageError, match="stage=zstd.compress") as exc:
+            store.write(tflow.tflow().get_state())
+        assert "sensitive payload" not in str(exc.value)
+
+
+@pytest.mark.parametrize("stage", ["compress", "chunk", "insert", "update"])
+def test_chunked_failure_diagnostics(tmp_path, monkeypatch, stage):
+    f = tflow.tflow()
+    raw = sqlite.tnetstring.dumps(f.get_state())
+    with sqlite.SQLiteFlowStore(tmp_path / "db") as store:
+        sequence = store.write(f.get_state()) if stage == "update" else None
+        store.db.execute("BEGIN IMMEDIATE")
+        if stage == "compress":
+
+            def fail(*args, **kwargs):
+                raise ValueError("secret raw payload")
+
+            monkeypatch.setattr(sqlite.zstd, "compress", fail)
+        elif stage == "chunk":
+            store.db.execute(sqlite._CHUNKS)
+            store.db.execute(
+                "CREATE TRIGGER fail_chunk BEFORE INSERT ON flow_payload_chunks BEGIN SELECT RAISE(ABORT, 'secret chunk payload'); END"
+            )
+        else:
+            operation = "UPDATE" if stage == "update" else "INSERT"
+            store.db.execute(
+                f"CREATE TRIGGER fail_flow BEFORE {operation} ON flows BEGIN SELECT RAISE(ABORT, 'secret flow payload'); END"
+            )
+        with pytest.raises(sqlite.StorageError) as exc:
+            store._write_chunked(
+                sqlite._metadata(f),
+                io.BytesIO(raw),
+                len(raw),
+                hashlib.sha256(raw).digest(),
+                sequence,
+                chunk_size=100,
+            )
+        message = str(exc.value)
+        expected = {
+            "compress": "zstd.compress.chunk",
+            "chunk": "sqlite.chunk.insert",
+            "insert": "sqlite.flow.insert",
+            "update": "sqlite.flow.update",
+        }[stage]
+        assert f"stage={expected}" in message
+        assert f"raw_length={len(raw)}" in message
+        assert (
+            "chunk_index=" in message
+            and "chunk_raw_length=" in message
+            and "compressed_length=" in message
+        )
+        assert ("ValueError" if stage == "compress" else "IntegrityError") in message
+        assert "secret" not in message
+        store.db.execute("ROLLBACK")
+
+
+def test_chunk_schema_revalidated_after_open(tmp_path):
+    f = tflow.tflow()
+    raw = sqlite.tnetstring.dumps(f.get_state())
+    with sqlite.SQLiteFlowStore(tmp_path / "db") as store:
+        store.db.execute("CREATE TABLE flow_payload_chunks (wrong)")
+        store.db.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite.StorageError, match="schema"):
+            store._write_chunked(
+                sqlite._metadata(f),
+                io.BytesIO(raw),
+                len(raw),
+                hashlib.sha256(raw).digest(),
+            )
+        store.db.execute("ROLLBACK")
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_stream_output_is_capped_even_with_large_request(tmp_path, version):
+    f = tflow.tflow()
+    f.request.raw_content = b"x" * 300_000
+    raw = sqlite.tnetstring.dumps(f.get_state())
+    path = tmp_path / "db"
+    with sqlite.SQLiteFlowStore(path) as store:
+        if version == 1:
+            store.write(f.get_state())
+        else:
+            store.db.execute("BEGIN IMMEDIATE")
+            store._write_chunked(
+                sqlite._metadata(f),
+                io.BytesIO(raw),
+                len(raw),
+                hashlib.sha256(raw).digest(),
+            )
+            store.db.execute("COMMIT")
+        with sqlite.SQLiteFlowReader(path) as reader:
+            chunks = list(reader.iter_raw(f.id, chunk_size=10**9))
+            assert max(map(len, chunks)) <= 65536
+            assert b"".join(chunks) == raw
+
+
+def test_reader_invalid_metadata_and_short_length(tmp_path):
+    path = tmp_path / "db"
+    f = tflow.tflow()
+    with sqlite.SQLiteFlowStore(path) as store:
+        store.write(f.get_state())
+        with sqlite.SQLiteFlowReader(path) as reader:
+            for mutation in (
+                "dictionary_id=1",
+                "raw_length=-1",
+                "codec='future'",
+                "raw_length=1",
+            ):
+                store.db.execute(f"UPDATE flows SET {mutation}")
+                with pytest.raises(sqlite.StorageError):
+                    b"".join(reader.iter_raw(f.id))
+                store.db.execute(
+                    "UPDATE flows SET dictionary_id=NULL, codec='zstd', raw_length=?",
+                    (len(sqlite.tnetstring.dumps(f.get_state())),),
+                )
+
+
+def test_missing_update_and_get_flow_race(tmp_path):
+    path = tmp_path / "db"
+    f = tflow.tflow()
+    raw = sqlite.tnetstring.dumps(f.get_state())
+    with sqlite.SQLiteFlowStore(path) as store:
+        store.db.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite.StorageError, match="not found"):
+            store._write_chunked(
+                sqlite._metadata(f),
+                io.BytesIO(raw),
+                len(raw),
+                hashlib.sha256(raw).digest(),
+                999,
+            )
+        store.db.execute("ROLLBACK")
+        store.write(f.get_state())
+        with sqlite.SQLiteFlowReader(path) as reader:
+            real = reader.db
+
+            class ConcurrentUpdate:
+                def execute(self, sql, *args):
+                    result = real.execute(sql, *args)
+                    if sql.startswith("SELECT payload_version FROM"):
+                        store.db.execute("UPDATE flows SET payload_version=2")
+                    return result
+
+            reader.db = ConcurrentUpdate()
+            try:
+                with pytest.raises(sqlite.StorageError, match="changed"):
+                    reader.get_flow(f.id)
+            finally:
+                reader.db = real
+
+
+def test_chunk_length_limit_and_real_disk_full(tmp_path):
+    f = tflow.tflow()
+    f.request.raw_content = os.urandom(128 * 1024)
+    raw = sqlite.tnetstring.dumps(f.get_state())
+    digest = hashlib.sha256(raw).digest()
+    with sqlite.SQLiteFlowStore(tmp_path / "db") as store:
+        store.db.execute("BEGIN IMMEDIATE")
+        old = store.db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 2000)
+        try:
+            with pytest.raises(sqlite.StorageError, match="limit"):
+                store._write_chunked(
+                    sqlite._metadata(f), io.BytesIO(raw), len(raw), digest
+                )
+        finally:
+            store.db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, old)
+        store.db.execute("ROLLBACK")
+        store.db.execute("BEGIN IMMEDIATE")
+        store.db.execute(sqlite._CHUNKS)
+        store.db.execute("COMMIT")
+        pages = store.db.execute("PRAGMA page_count").fetchone()[0]
+        store.db.execute(f"PRAGMA max_page_count={pages}")
+        try:
+            store.db.execute("BEGIN IMMEDIATE")
+            with pytest.raises(
+                sqlite.StorageError, match=r"stage=sqlite.chunk.insert.*full"
+            ):
+                store._write_chunked(
+                    sqlite._metadata(f),
+                    io.BytesIO(raw),
+                    len(raw),
+                    digest,
+                    chunk_size=8192,
+                )
+        finally:
+            if store.db.in_transaction:
+                store.db.execute("ROLLBACK")
+            store.db.execute("PRAGMA max_page_count=1073741823")
+
+
+@pytest.mark.parametrize("limit", [4096, None])
+def test_chunk_writer_caps_read_size(tmp_path, limit):
+    class TrackingInput(io.BytesIO):
+        def __init__(self, data):
+            super().__init__(data)
+            self.requested = []
+
+        def read(self, size=-1):
+            self.requested.append(size)
+            return super().read(size)
+
+    f = tflow.tflow()
+    raw = b"x" * (sqlite._MAX_CHUNK + 100)
+    source = TrackingInput(raw)
+    with sqlite.SQLiteFlowStore(tmp_path / "db") as store:
+        store.db.execute("BEGIN IMMEDIATE")
+        if limit is not None:
+            previous = store.db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, limit)
+        try:
+            store._write_chunked(
+                sqlite._metadata(f),
+                source,
+                len(raw),
+                hashlib.sha256(raw).digest(),
+                chunk_size=10**9,
+            )
+        finally:
+            if limit is not None:
+                store.db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, previous)
+        store.db.execute("ROLLBACK")
+    expected = (limit - 1024) // 2 if limit else sqlite._MAX_CHUNK
+    assert max(source.requested) == expected
+
+
+def test_chunked_flow_binding_error_is_sanitized(tmp_path):
+    f = tflow.tflow()
+    raw = sqlite.tnetstring.dumps(f.get_state())
+    metadata = (object(), *sqlite._metadata(f)[1:])
+    with sqlite.SQLiteFlowStore(tmp_path / "db") as store:
+        store.db.execute("BEGIN IMMEDIATE")
+        with pytest.raises(
+            sqlite.StorageError, match=r"stage=sqlite.flow.insert.*ProgrammingError"
+        ) as exc:
+            store._write_chunked(
+                metadata, io.BytesIO(raw), len(raw), hashlib.sha256(raw).digest()
+            )
+        assert "not supported" not in str(exc.value)
+        store.db.execute("ROLLBACK")
 
 
 def test_roundtrip_and_duplicate(tmp_path):
