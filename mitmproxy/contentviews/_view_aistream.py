@@ -7,11 +7,11 @@ token usage.
 """
 
 import json
-import typing
 from typing import Any
 
 from mitmproxy.contentviews._api import Contentview
 from mitmproxy.contentviews._api import Metadata
+from mitmproxy.contentviews._api import SyntaxHighlight
 
 
 def parse_sse(data: str) -> tuple[list[tuple[str | None, str]], int]:
@@ -492,10 +492,10 @@ class AIStreamContentview(Contentview):
     name = "AI Stream"
 
     @property
-    def syntax_highlight(self) -> str:
+    def syntax_highlight(self) -> SyntaxHighlight:
         return "yaml"
 
-    def _parse(self, data: bytes) -> tuple[list[Any], int, bool]:
+    def _parse(self, data: bytes) -> tuple[list[Any], bool, int]:
         events, comments = parse_sse(data.decode("utf-8", "replace"))
         return (*_payloads(events), comments)
 

@@ -2,10 +2,9 @@ import json
 
 import pytest
 
-from mitmproxy.contentviews import Metadata
 from mitmproxy.contentviews import ai_stream
+from mitmproxy.contentviews import Metadata
 from mitmproxy.contentviews._view_aistream import parse_sse
-
 
 CHAT_STREAM = (
     ": OPENROUTER PROCESSING\n"
