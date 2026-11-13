@@ -33,6 +33,37 @@ def test_roundtrip_and_duplicate(tmp_path):
         assert [x.sequence for x in reader.older(3, 10)] == [2, 1]
 
 
+def test_payload_helper_updates_sequence(tmp_path):
+    path = tmp_path / "db"
+    f = tflow.tflow()
+    with sqlite.SQLiteFlowStore(path) as store:
+        sequence = store.write(f.get_state())
+        f.comment = "updated"
+        store.db.execute("BEGIN IMMEDIATE")
+        assert (
+            store._write_payload(f, sqlite.tnetstring.dumps(f.get_state()), sequence)
+            == sequence
+        )
+        store.db.execute("COMMIT")
+        with sqlite.SQLiteFlowReader(path) as reader:
+            assert reader.get_flow(f.id).comment == "updated"
+            assert reader.newest(1)[0].sequence == sequence
+
+
+def test_read_only_validation_of_empty_database(tmp_path):
+    path = tmp_path / "db"
+    path.touch()
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+        sqlite._validate(db, allow_empty=True)
+        with pytest.raises(sqlite.StorageError, match="schema"):
+            sqlite._validate(db)
+    assert path.stat().st_size == 0
+    with closing(sqlite3.connect(path)) as db:
+        db.execute("CREATE TABLE unrelated (keep)")
+        with pytest.raises(sqlite.StorageError, match="schema"):
+            sqlite._validate(db, allow_empty=True)
+
+
 def test_close_empty_writer_before_start(tmp_path):
     path = tmp_path / "db"
     start: Future[None] = Future()

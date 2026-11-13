@@ -74,34 +74,41 @@ _SCHEMA = """CREATE TABLE flows (
 _COLUMNS = "sequence, flow_id, timestamp, flow_type, method, host, path, status_code, request_size, response_size"
 
 
-def _validate(db: sqlite3.Connection) -> None:
+def _validate(db: sqlite3.Connection, *, allow_empty: bool = False) -> None:
     app = db.execute("PRAGMA application_id").fetchone()[0]
     version = db.execute("PRAGMA user_version").fetchone()[0]
     schema = db.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='flows'"
     ).fetchone()
+    if allow_empty and app == 0 and version == 0:
+        if db.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
+            return
     if app != _APP_ID or version != 1 or not schema or schema[0] != _SCHEMA:
         raise StorageError("Incompatible or invalid flow database schema")
+
+
+def _secure_directory(path: Path) -> None:
+    if ".." in path.parts:
+        raise StorageError(f"Unsafe database directory: {path.parent}")
+    parent = path.absolute().parent
+    for directory in (parent, *parent.parents):
+        info = directory.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid not in (0, os.geteuid())
+            or (
+                info.st_mode & 0o022
+                and (directory == parent or not info.st_mode & stat.S_ISVTX)
+            )
+        ):
+            raise StorageError(f"Unsafe database directory: {directory}")
 
 
 def _secure_path(path: Path, create: bool) -> None:
     flags = os.O_RDWR if create else os.O_RDONLY
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        if ".." in path.parts:
-            raise StorageError(f"Unsafe database directory: {path.parent}")
-        parent = path.absolute().parent
-        for directory in (parent, *parent.parents):
-            info = directory.lstat()
-            if (
-                not stat.S_ISDIR(info.st_mode)
-                or info.st_uid not in (0, os.geteuid())
-                or (
-                    info.st_mode & 0o022
-                    and (directory == parent or not info.st_mode & stat.S_ISVTX)
-                )
-            ):
-                raise StorageError(f"Unsafe database directory: {directory}")
+        _secure_directory(path)
         if create:
             try:
                 fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
@@ -223,6 +230,30 @@ class SQLiteFlowStore:
                 raise
             raise StorageError(f"Cannot initialize flow database {path}: {e}") from e
 
+    def _write_payload(
+        self, f: flow.Flow, raw: bytes, sequence: int | None = None
+    ) -> int:
+        payload = zstd.compress(
+            raw,
+            options={
+                zstd.CompressionParameter.compression_level: 3,
+                zstd.CompressionParameter.checksum_flag: 1,
+            },
+        )
+        values = (*_metadata(f), len(raw), payload)
+        if sequence is None:
+            cursor = self.db.execute(
+                "INSERT INTO flows (flow_id,timestamp,flow_type,method,host,path,status_code,request_size,response_size,payload_version,codec,dictionary_id,raw_length,payload) VALUES (?,?,?,?,?,?,?,?,?,1,'zstd',NULL,?,?)",
+                values,
+            )
+            assert cursor.lastrowid is not None
+            return cursor.lastrowid
+        self.db.execute(
+            "UPDATE flows SET flow_id=?,timestamp=?,flow_type=?,method=?,host=?,path=?,status_code=?,request_size=?,response_size=?,payload_version=1,codec='zstd',dictionary_id=NULL,raw_length=?,payload=? WHERE sequence=?",
+            (*values, sequence),
+        )
+        return sequence
+
     def write(self, state: serializable.State) -> int:
         """Return the sequence only after commit; reject a changed existing ID."""
         flow_id = state.get("id", "unknown")
@@ -233,7 +264,6 @@ class SQLiteFlowStore:
         try:
             raw = tnetstring.dumps(state)
             f = flow.Flow.from_state(copy.deepcopy(state))
-            metadata = _metadata(f)
             self.db.execute("BEGIN IMMEDIATE")
             existing = self.db.execute(
                 "SELECT sequence,payload_version,codec,dictionary_id,raw_length,payload FROM flows WHERE flow_id=?",
@@ -244,18 +274,7 @@ class SQLiteFlowStore:
                 if _decompress(tuple(payload_fields)) != raw:
                     raise StorageError(f"conflicting state for flow {flow_id}")
             else:
-                payload = zstd.compress(
-                    raw,
-                    options={
-                        zstd.CompressionParameter.compression_level: 3,
-                        zstd.CompressionParameter.checksum_flag: 1,
-                    },
-                )
-                cursor = self.db.execute(
-                    "INSERT INTO flows (flow_id,timestamp,flow_type,method,host,path,status_code,request_size,response_size,payload_version,codec,dictionary_id,raw_length,payload) VALUES (?,?,?,?,?,?,?,?,?,1,'zstd',NULL,?,?)",
-                    (*metadata, len(raw), payload),
-                )
-                sequence = cursor.lastrowid
+                sequence = self._write_payload(f, raw)
             self.db.execute("COMMIT")
             return sequence
         except Exception as e:
