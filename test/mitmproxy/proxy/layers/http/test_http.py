@@ -3,10 +3,12 @@ from logging import WARNING
 
 import pytest
 
+from mitmproxy.addons import save
 from mitmproxy.connection import ConnectionState
 from mitmproxy.connection import Server
 from mitmproxy.http import HTTPFlow
 from mitmproxy.http import Response
+from mitmproxy.io import sqlite
 from mitmproxy.proxy import layer
 from mitmproxy.proxy.commands import CloseConnection
 from mitmproxy.proxy.commands import Log
@@ -24,6 +26,7 @@ from mitmproxy.proxy.layers.websocket import WebsocketStartHook
 from mitmproxy.proxy.mode_specs import ProxyMode
 from mitmproxy.tcp import TCPFlow
 from mitmproxy.tcp import TCPMessage
+from mitmproxy.test import taddons
 from test.mitmproxy.proxy.tutils import BytesMatching
 from test.mitmproxy.proxy.tutils import Placeholder
 from test.mitmproxy.proxy.tutils import Playbook
@@ -337,7 +340,7 @@ def test_disconnect_while_intercept(tctx):
 
 
 @pytest.mark.parametrize("store_streamed_bodies", [False, True])
-def test_store_streamed_bodies(tctx, store_streamed_bodies):
+async def test_store_streamed_bodies(tctx, store_streamed_bodies, tmp_path):
     """Test HTTP stream modification"""
     tctx.options.store_streamed_bodies = store_streamed_bodies
     server = Placeholder(Server)
@@ -412,6 +415,23 @@ def test_store_streamed_bodies(tctx, store_streamed_bodies):
         assert flow().response.data.content is None
     assert observed == [b"[", b"def", b"]", b"[]"]
     assert content_during_observation == [None] * 4
+
+    path = tmp_path / "streamed.db"
+    recorder = save.Save()
+    with taddons.context(recorder) as addons:
+        addons.configure(recorder, save_sqlite_file=str(path))
+        await recorder.running()
+        recorder.response(flow())
+        await recorder.done()
+    with sqlite.SQLiteFlowReader(path) as reader:
+        restored = reader.get_flow(flow().id)
+        assert restored.get_state() == flow().get_state()
+        assert restored.request.raw_content == (
+            b"[abc][]" if store_streamed_bodies else None
+        )
+        assert restored.response.raw_content == (
+            b"[def][]" if store_streamed_bodies else None
+        )
 
 
 @pytest.mark.parametrize("why", ["body_size=0", "body_size=3", "addon"])

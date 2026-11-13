@@ -57,30 +57,33 @@ class Master:
             asyncio_utils.set_eager_task_factory(),
         ):
             self.should_exit.clear()
-
-            # Can we exit before even bringing up servers?
-            if ec := self.addons.get("errorcheck"):
-                await ec.shutdown_if_errored()
-            if ps := self.addons.get("proxyserver"):
-                # This may block for some proxy modes, so we also monitor should_exit.
-                await asyncio.wait(
-                    [
-                        asyncio_utils.create_task(
-                            ps.setup_servers(), name="setup_servers", keep_ref=False
-                        ),
-                        asyncio_utils.create_task(
-                            self.should_exit.wait(), name="should_exit", keep_ref=False
-                        ),
-                    ],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if self.should_exit.is_set():
-                    return
-                # Did bringing up servers fail?
+            running = False
+            try:
+                # Can we exit before even bringing up servers?
                 if ec := self.addons.get("errorcheck"):
                     await ec.shutdown_if_errored()
+                if ps := self.addons.get("proxyserver"):
+                    # This may block for some proxy modes, so we also monitor should_exit.
+                    await asyncio.wait(
+                        [
+                            asyncio_utils.create_task(
+                                ps.setup_servers(), name="setup_servers", keep_ref=False
+                            ),
+                            asyncio_utils.create_task(
+                                self.should_exit.wait(),
+                                name="should_exit",
+                                keep_ref=False,
+                            ),
+                        ],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if self.should_exit.is_set():
+                        return
+                    # Did bringing up servers fail?
+                    if ec := self.addons.get("errorcheck"):
+                        await ec.shutdown_if_errored()
 
-            try:
+                running = True
                 await self.running()
                 # Any errors in the final part of startup?
                 if ec := self.addons.get("errorcheck"):
@@ -91,7 +94,13 @@ class Master:
             finally:
                 # if running() was called, we also always want to call done().
                 # .wait might be cancelled (e.g. by sys.exit), so  this needs to be in a finally block.
-                await self.done()
+                if running:
+                    await self.done()
+                elif close_sqlite := getattr(
+                    self.addons.get("save"), "close_sqlite", None
+                ):
+                    if drain := close_sqlite():
+                        await drain
 
     def shutdown(self):
         """

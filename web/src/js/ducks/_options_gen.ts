@@ -54,6 +54,7 @@ export interface OptionsState {
     redacted_headers_replacement: string;
     request_client_cert: boolean;
     rfile: string | undefined;
+    save_sqlite_file: string | undefined;
     save_stream_file: string | undefined;
     save_stream_filter: string | undefined;
     scripts: string[];
@@ -166,6 +167,7 @@ export const defaultState: OptionsState = {
     redacted_headers_replacement: "[redacted]",
     request_client_cert: false,
     rfile: undefined,
+    save_sqlite_file: undefined,
     save_stream_file: undefined,
     save_stream_filter: undefined,
     scripts: [],

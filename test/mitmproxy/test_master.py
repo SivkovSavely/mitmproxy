@@ -31,3 +31,26 @@ async def test_exception_handler(caplog_async):
 
     master.shutdown()
     await running
+
+
+async def test_early_shutdown_with_custom_save_addon():
+    master = Master(None)
+    stopped = []
+
+    class Recorder:
+        name = "save"
+
+        def done(self):
+            stopped.append(True)
+
+    class Proxyserver:
+        async def setup_servers(self):
+            master.shutdown()
+
+    master.addons.add(Recorder(), Proxyserver())
+    try:
+        await master.run()
+        assert master.should_exit.is_set()
+        assert not stopped
+    finally:
+        await master.done()
