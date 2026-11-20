@@ -149,6 +149,8 @@ class View(collections.abc.Sequence):
         self._store: collections.OrderedDict[str, mitmproxy.flow.Flow] = (
             collections.OrderedDict()
         )
+        # Store revision; in-place flow changes are tracked when update is called.
+        self.generation = 0
         self.filter = flowfilter.match_all
         # Should we show only marked flows?
         self.show_marked = False
@@ -179,7 +181,11 @@ class View(collections.abc.Sequence):
         # store. If a flow is removed from just the view, sig_view_remove is
         # triggered. If it is removed from the store while it is also in the
         # view, both sig_store_remove and sig_view_remove are triggered.
+        self.sig_store_add = signals.SyncSignal(_signal_with_flow)
+        self.sig_store_update = signals.SyncSignal(_signal_with_flow)
         self.sig_store_remove = signals.SyncSignal(_signal_with_flow)
+        # Unlike refresh, clear always means that the whole store is empty.
+        self.sig_store_clear = signals.SyncSignal(lambda: None)
         # Signals that the store should be refreshed completely
         self.sig_store_refresh = signals.SyncSignal(lambda: None)
 
@@ -361,7 +367,10 @@ class View(collections.abc.Sequence):
         """
         Clears both the store and view.
         """
+        if self._store:
+            self.generation += 1
         self._store.clear()
+        self.sig_store_clear.send()
         self._view.clear()
         self.sig_view_refresh.send()
         self.sig_store_refresh.send()
@@ -374,6 +383,8 @@ class View(collections.abc.Sequence):
         for flow in self._store.copy().values():
             if not flow.marked:
                 self._store.pop(flow.id)
+                self.generation += 1
+                self.sig_store_remove.send(flow=flow)
 
         self._refilter()
         self.sig_store_refresh.send()
@@ -432,6 +443,7 @@ class View(collections.abc.Sequence):
         """
         for f in flows:
             if f.id in self._store:
+                self.generation += 1
                 if f.killable:
                     f.kill()
                 if f in self._view:
@@ -516,6 +528,8 @@ class View(collections.abc.Sequence):
         for f in flows:
             if f.id not in self._store:
                 self._store[f.id] = f
+                self.generation += 1
+                self.sig_store_add.send(flow=f)
                 if self.filter(f):
                     self._base_add(f)
                     if self.focus_follow:
@@ -583,7 +597,13 @@ class View(collections.abc.Sequence):
     def requestheaders(self, f):
         self.add([f])
 
+    def request(self, f):
+        self.update([f])
+
     def error(self, f):
+        self.update([f])
+
+    def responseheaders(self, f):
         self.update([f])
 
     def response(self, f):
@@ -637,6 +657,8 @@ class View(collections.abc.Sequence):
         """
         for f in flows:
             if f.id in self._store:
+                self.generation += 1
+                self.sig_store_update.send(flow=f)
                 if self.filter(f):
                     if f not in self._view:
                         self._base_add(f)

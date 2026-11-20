@@ -9,6 +9,7 @@ import timeRange, {
     isWithinTimeRange,
     parseLocalDateTime,
     updateDraft,
+    setGrouping,
 } from "../../ducks/timeRange";
 import { reducer, middlewares } from "../../ducks/store";
 
@@ -20,6 +21,22 @@ function createStore() {
 }
 
 beforeEach(() => localStorage.clear());
+
+test("grouping survives reconnect and reload only for the same backend instance", () => {
+    const store = createStore();
+    store.dispatch(setGrouping("host"));
+    expect(store.getState().timeRange.grouping).toBe("none");
+    store.dispatch(establishBackend("backend-a"));
+    store.dispatch(setGrouping("host"));
+    store.dispatch(backendConnecting());
+    store.dispatch(establishBackend("backend-a"));
+    expect(store.getState().timeRange.grouping).toBe("host");
+    const reloaded = createStore();
+    reloaded.dispatch(establishBackend("backend-a"));
+    expect(reloaded.getState().timeRange.grouping).toBe("host");
+    reloaded.dispatch(establishBackend("backend-b"));
+    expect(reloaded.getState().timeRange.grouping).toBe("none");
+});
 
 test("preferences are unusable until a real authenticated backend ID is established", () => {
     const store = createStore();

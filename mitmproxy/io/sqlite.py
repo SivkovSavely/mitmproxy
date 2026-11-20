@@ -16,6 +16,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import uuid
 from collections import deque
 from collections.abc import Callable
 from collections.abc import Iterable
@@ -89,6 +90,173 @@ _CHUNKS = """CREATE TABLE flow_payload_chunks (
     PRIMARY KEY(sequence, ordinal)
 )"""
 _MAX_CHUNK = 8 * 1024 * 1024
+_REVISION = """CREATE TABLE flow_revision (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    database_id TEXT NOT NULL CHECK(length(database_id)=32 AND database_id NOT GLOB '*[^0-9a-f]*'),
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>=0)
+)"""
+_REVISION_TRIGGERS = {
+    f"flows_revision_{operation.lower()}": f"""CREATE TRIGGER flows_revision_{operation.lower()} AFTER {operation} ON flows BEGIN
+    UPDATE flow_revision SET revision=revision+1 WHERE singleton=1 AND revision<9223372036854775807;
+    SELECT CASE WHEN changes()!=1 THEN RAISE(ABORT, 'Invalid or exhausted flow revision') END;
+END"""
+    for operation in ("INSERT", "UPDATE", "DELETE")
+}
+
+_CHANGE_COLUMNS = _COLUMNS + ", payload_version"
+_JOURNAL = """CREATE TABLE flow_changes (
+    revision INTEGER PRIMARY KEY, old_flow_id TEXT,
+    sequence INTEGER, flow_id TEXT, timestamp REAL, flow_type TEXT,
+    method TEXT, host TEXT, path TEXT, status_code INTEGER,
+    request_size INTEGER, response_size INTEGER, payload_version INTEGER,
+    oversized INTEGER NOT NULL, watermark INTEGER NOT NULL
+)"""
+_JOURNAL_STATE = """CREATE TABLE flow_change_state (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    floor INTEGER NOT NULL, watermark INTEGER NOT NULL, pending_gap INTEGER NOT NULL
+)"""
+_JOURNAL_INDEX = "CREATE INDEX flow_changes_watermark ON flow_changes(watermark)"
+_JOURNAL_LIMIT = 64 * 1024 * 1024
+
+
+def _journal_triggers() -> dict[str, str]:
+    triggers = {}
+    for operation in ("INSERT", "UPDATE", "DELETE"):
+        name = f"flows_revision_{operation.lower()}"
+        old = "OLD.flow_id" if operation != "INSERT" else "NULL"
+        new = operation != "DELETE"
+        fields = []
+        for column in _CHANGE_COLUMNS.split(", "):
+            if not new:
+                fields.append("NULL")
+            elif column in ("flow_type", "method", "host"):
+                fields.append(
+                    f"CASE WHEN length(CAST(NEW.{column} AS BLOB))>1048576 THEN NULL ELSE NEW.{column} END"
+                )
+            elif column == "path":
+                fields.append("substr(NEW.path,1,4096)")
+            else:
+                fields.append(f"NEW.{column}")
+        oversized = (
+            " + ".join(
+                f"CASE WHEN length(CAST(NEW.{column} AS BLOB))>1048576 THEN {bit} ELSE 0 END"
+                for column, bit in (("flow_type", 1), ("method", 2), ("host", 4))
+            )
+            if new
+            else "0"
+        )
+        # IDs are normally UUIDs. An abnormally large ID expires readers instead
+        # of allowing an unbounded journal record.
+        id_too_large = f"coalesce(length(CAST({old} AS BLOB)),0)>1048576"
+        if new:
+            id_too_large += " OR length(CAST(NEW.flow_id AS BLOB))>1048576"
+        safe_old = (
+            f"CASE WHEN length(CAST({old} AS BLOB))>1048576 THEN NULL ELSE {old} END"
+        )
+        if new:
+            fields[1] = (
+                "CASE WHEN length(CAST(NEW.flow_id AS BLOB))>1048576 THEN NULL ELSE NEW.flow_id END"
+            )
+        size = "256 + " + " + ".join(
+            f"coalesce(length(CAST(({x}) AS BLOB)),0)" for x in [safe_old, *fields]
+        )
+        # Retire only retained revisions before resetting the byte watermark.
+        overflow = f"watermark>9223372036854775807-({size})"
+        triggers[name] = f"""CREATE TRIGGER {name} AFTER {operation} ON flows BEGIN
+    UPDATE flow_revision SET revision=revision+1 WHERE singleton=1 AND revision<9223372036854775807;
+    SELECT CASE WHEN changes()!=1 THEN RAISE(ABORT, 'Invalid or exhausted flow revision') END;
+    DELETE FROM flow_changes WHERE revision<=coalesce((SELECT CASE WHEN {overflow} THEN (SELECT revision-1 FROM flow_revision) ELSE -1 END FROM flow_change_state WHERE singleton=1),-1);
+    UPDATE flow_change_state SET floor=(SELECT revision-1 FROM flow_revision), watermark=0 WHERE singleton=1 AND {overflow};
+    UPDATE flow_change_state SET watermark=watermark+({size}), floor=CASE WHEN pending_gap OR {id_too_large} THEN (SELECT revision FROM flow_revision) ELSE floor END, pending_gap=0 WHERE singleton=1;
+    INSERT INTO flow_changes VALUES ((SELECT revision FROM flow_revision),{safe_old},{",".join(fields)},{oversized},(SELECT watermark FROM flow_change_state));
+    UPDATE flow_change_state SET floor=max(floor,coalesce((SELECT revision FROM flow_changes WHERE watermark<=flow_change_state.watermark-{_JOURNAL_LIMIT} ORDER BY watermark DESC LIMIT 1),floor)) WHERE singleton=1;
+    DELETE FROM flow_changes WHERE revision<=(SELECT floor FROM flow_change_state);
+END"""
+    for operation in ("INSERT", "UPDATE"):
+        name = f"flows_change_conflict_{operation.lower()}"
+        exclude = "" if operation == "INSERT" else " AND sequence!=OLD.sequence"
+        triggers[
+            name
+        ] = f"""CREATE TRIGGER {name} BEFORE {operation} ON flows WHEN EXISTS (
+    SELECT 1 FROM flows WHERE (flow_id=NEW.flow_id OR sequence=NEW.sequence){exclude}
+) BEGIN
+    UPDATE flow_change_state SET pending_gap=1 WHERE singleton=1;
+END"""
+    return triggers
+
+
+_JOURNAL_TRIGGERS = _journal_triggers()
+_JOURNAL_OBJECTS = {
+    "flow_changes": ("table", _JOURNAL),
+    "flow_change_state": ("table", _JOURNAL_STATE),
+    "flow_changes_watermark": ("index", _JOURNAL_INDEX),
+} | {name: ("trigger", sql) for name, sql in _JOURNAL_TRIGGERS.items()}
+
+
+def _read_revision(db: sqlite3.Connection) -> tuple[str, int] | None:
+    legacy = {"flow_revision": ("table", _REVISION)} | {
+        name: ("trigger", sql) for name, sql in _REVISION_TRIGGERS.items()
+    }
+    current = {"flow_revision": ("table", _REVISION)} | _JOURNAL_OBJECTS
+    names = set(legacy) | set(current)
+    rows = db.execute(
+        f"SELECT name,type,sql FROM sqlite_master WHERE name IN ({','.join('?' for _ in names)})",
+        tuple(names),
+    ).fetchall()
+    if not rows:
+        return None
+    found = {name: (kind, sql) for name, kind, sql in rows}
+    if found != legacy and found != current:
+        raise StorageError("Incompatible flow revision schema")
+    values = db.execute(
+        "SELECT singleton,database_id,revision FROM main.flow_revision"
+    ).fetchall()
+    if len(values) != 1:
+        raise StorageError("Invalid flow revision state")
+    singleton, identity, revision = values[0]
+    if (
+        singleton != 1
+        or not isinstance(identity, str)
+        or len(identity) != 32
+        or any(c not in "0123456789abcdef" for c in identity)
+        or type(revision) is not int
+        or not 0 <= revision <= 2**63 - 1
+    ):
+        raise StorageError("Invalid flow revision state")
+    if found == current:
+        states = db.execute(
+            "SELECT singleton,floor,watermark,pending_gap FROM flow_change_state"
+        ).fetchall()
+        if (
+            len(states) != 1
+            or states[0][0] != 1
+            or type(states[0][1]) is not int
+            or not 0 <= states[0][1] <= revision
+            or type(states[0][2]) is not int
+            or not 0 <= states[0][2] <= _LIVE_SEQUENCE
+            or type(states[0][3]) is not int
+            or states[0][3] not in (0, 1)
+        ):
+            raise StorageError("Invalid flow revision journal state")
+    return identity, revision
+
+
+def _ensure_revision(db: sqlite3.Connection) -> None:
+    # Called under the setup write lock, so other connections cannot miss changes.
+    if _read_revision(db) is None:
+        db.execute(_REVISION)
+        db.execute("INSERT INTO flow_revision VALUES (1,?,0)", (uuid.uuid4().hex,))
+    elif db.execute("SELECT 1 FROM sqlite_master WHERE name='flow_changes'").fetchone():
+        return
+    else:
+        for name in _REVISION_TRIGGERS:
+            db.execute(f"DROP TRIGGER {name}")
+    db.execute(_JOURNAL)
+    db.execute(_JOURNAL_STATE)
+    db.execute("INSERT INTO flow_change_state SELECT 1,revision,0,0 FROM flow_revision")
+    db.execute(_JOURNAL_INDEX)
+    for sql in _JOURNAL_TRIGGERS.values():
+        db.execute(sql)
 
 
 def _validate(db: sqlite3.Connection, *, allow_empty: bool = False) -> None:
@@ -103,6 +271,7 @@ def _validate(db: sqlite3.Connection, *, allow_empty: bool = False) -> None:
     if app != _APP_ID or version != 1 or not schema or schema[0] != _SCHEMA:
         raise StorageError("Incompatible or invalid flow database schema")
     _validate_chunks(db)
+    _read_revision(db)
 
 
 def _validate_chunks(db: sqlite3.Connection) -> None:
@@ -203,7 +372,7 @@ def _decompress(row: tuple) -> bytes:
 def ensure_history_index(
     path: str | Path, *, cancel: Callable[[], bool] | None = None
 ) -> None:
-    """Add the chronological index to an existing recording, without payload writes.
+    """Initialize history index and revision tracking without payload reads/writes.
 
     Blocking: run in the history worker, not on the web event loop. This does not
     create missing databases, change journal mode, or initialize a flow writer.
@@ -229,6 +398,7 @@ def ensure_history_index(
         if cancel and cancel():
             raise StorageError("History request cancelled")
         db.execute(_HISTORY_INDEX)
+        _ensure_revision(db)
         if cancel and cancel():
             raise StorageError("History request cancelled")
         db.execute("COMMIT")
@@ -305,6 +475,7 @@ class SQLiteFlowStore:
             else:
                 _validate(self.db)
             self.db.execute(_HISTORY_INDEX)
+            _ensure_revision(self.db)
             self.db.execute("COMMIT")
             if self.db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
                 raise StorageError("Cannot enable SQLite WAL mode")
@@ -529,6 +700,56 @@ class SQLiteFlowReader:
             if isinstance(e, StorageError):
                 raise
             raise StorageError(f"Cannot open flow database {path}: {e}") from e
+
+    def revision(self) -> tuple[str, int]:
+        """Return persisted (database identity, mutation counter) from this reader.
+
+        Uses the caller's read transaction, if any; does not open another source
+        or commit/rollback. BEGIN before reading this and metadata to obtain one
+        snapshot. Legacy databases require ensure_history_index or a writer first.
+        The counter tracks flow-row mutations, not payload-chunk-only changes.
+        Independent new databases have different identities; byte-for-byte copies
+        retain their identity. An already open reader remains on its opened file.
+        """
+        try:
+            revision = _read_revision(self.db)
+            if revision is None:
+                raise StorageError("Flow revision is not initialized")
+            return revision
+        except sqlite3.Error as e:
+            raise StorageError(f"Cannot read flow revision: {e}") from e
+
+    def changes(self, after: int, until: int, limit: int) -> list[dict]:
+        """Read immutable changes in (after, until]; BEGIN for a consistent cut.
+
+        Check database identity with revision() separately. A journal gap requires
+        rebuilding the baseline. The caller owns the read transaction.
+        """
+        if (
+            type(after) is not int
+            or type(until) is not int
+            or not 0 <= after <= until <= _LIVE_SEQUENCE
+            or type(limit) is not int
+            or not 1 <= limit <= 8192
+        ):
+            raise ValueError("Invalid flow change bounds")
+        try:
+            state = self.db.execute(
+                "SELECT floor FROM flow_change_state WHERE singleton=1"
+            ).fetchone()
+            if state is None:
+                raise StorageError("Invalid flow change journal state")
+            if after < state[0]:
+                raise StorageError("Flow change journal cursor expired")
+            columns = "revision, old_flow_id, " + _CHANGE_COLUMNS + ", oversized"
+            rows = self.db.execute(
+                f"SELECT {columns} FROM flow_changes WHERE revision>? AND revision<=? ORDER BY revision LIMIT ?",
+                (after, until, limit),
+            )
+            names = columns.split(", ")
+            return [dict(zip(names, row)) for row in rows]
+        except sqlite3.Error as e:
+            raise StorageError(f"Cannot read flow change journal: {e}") from e
 
     def get_flow(self, flow_id: str) -> flow.Flow | None:
         try:
@@ -773,15 +994,21 @@ class SQLiteFlowReader:
             ):
                 raise ValueError("Invalid live history metadata")
             live_ids.add(row["id"])
+            method = row.get("method")
+            if method is not None:
+                try:
+                    method.encode("utf-8")
+                except UnicodeEncodeError:
+                    method = method.encode("utf-8", "surrogateescape")
             live_values.append(
                 (
                     row["id"],
                     row["timestamp_created"],
                     row["type"],
+                    method,
                     *(
                         row.get(key)
                         for key in (
-                            "method",
                             "host",
                             "path",
                             "status_code",
@@ -923,6 +1150,8 @@ class SQLiteFlowReader:
             columns = [column[0] for column in cursor.description]
             for values in cursor:
                 row = dict(zip(columns, values))
+                if isinstance(row["method"], bytes):
+                    row["method"] = row["method"].decode("utf-8", "replace")
                 row["live"] = bool(row["live"])
                 row["highlighted"] = bool(row["highlighted"])
                 result["rows"].append(row)

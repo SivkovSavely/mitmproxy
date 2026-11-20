@@ -45,10 +45,24 @@ function props() {
 }
 
 async function respond(index: number, data: unknown) {
+    const result = data as { groups?: { key: string; label?: string }[] };
     await act(async () => {
         requests[index].resolve({
             ok: true,
-            json: async () => data,
+            json: async () => ({
+                ...(requests[index].url.pathname.endsWith("flow-history")
+                    ? { snapshot: "s1" }
+                    : {}),
+                ...result,
+                ...(result.groups
+                    ? {
+                          groups: result.groups.map((group) => ({
+                              label: group.key,
+                              ...group,
+                          })),
+                      }
+                    : {}),
+            }),
         } as Response);
     });
 }
@@ -86,6 +100,808 @@ afterEach(() => {
 });
 
 describe("virtual SQLite history", () => {
+    it("shows grouped filter resource errors without clearing the selected flow", async () => {
+        const input = props();
+        input.timeRange.grouping = "host";
+        input.selected = summary(0);
+        render(<PureHistoryTable {...input} />);
+        await act(async () =>
+            requests[0].resolve({
+                ok: false,
+                status: 503,
+                text: async () =>
+                    "Live filter input unavailable: use No grouping for larger inputs.",
+            } as Response),
+        );
+        expect(screen.getByRole("alert")).toHaveTextContent(
+            "Live filter input unavailable: use No grouping for larger inputs.",
+        );
+        expect(input.onClear).not.toHaveBeenCalled();
+    });
+
+    it("refreshes from the displayed snapshot using the current relative window", async () => {
+        const input = props();
+        input.timeRange.grouping = "host";
+        const view = render(<PureHistoryTable {...input} />);
+        await respond(0, {
+            instance_id: "instance-a",
+            snapshot: "s1",
+            lower: 100,
+            upper: 200,
+            count: 0,
+            group_count: 0,
+            offset: 0,
+            groups: [],
+        });
+        view.rerender(
+            <PureHistoryTable
+                {...input}
+                timeRange={{ ...input.timeRange, historyRevision: 1 }}
+            />,
+        );
+        settle(1000);
+        expect(requests[1].url.searchParams.get("refresh")).toBe("s1");
+        expect(requests[1].url.searchParams.has("snapshot")).toBe(false);
+        expect(requests[1].url.searchParams.get("mode")).toBe("relative");
+        await respond(1, {
+            instance_id: "instance-a",
+            snapshot: "s2",
+            lower: 110,
+            upper: 205,
+            count: 0,
+            group_count: 0,
+            offset: 0,
+            groups: [],
+        });
+    });
+
+    it("discards stale snapshot rows and retries once with the current window and stable expansion", async () => {
+        const input = props();
+        input.timeRange.grouping = "host";
+        render(<PureHistoryTable {...input} />);
+        const groups = (snapshot: string) => ({
+            instance_id: "instance-a",
+            snapshot,
+            lower: 100,
+            upper: 200,
+            count: 20,
+            group_count: 1,
+            offset: 0,
+            groups: [
+                {
+                    key: "g1:opaque",
+                    label: "Visible label",
+                    count: 20,
+                    ordinal: 0,
+                    members_before: 0,
+                },
+            ],
+        });
+        await respond(0, groups("s1"));
+        expect(
+            screen.queryByRole("button", { name: /g1:opaque/ }),
+        ).not.toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: /Visible label/ }));
+        await act(async () => {});
+        await act(async () =>
+            requests[1].resolve({ ok: false, status: 409 } as Response),
+        );
+        expect(
+            screen.queryByRole("button", { name: /Visible label/ }),
+        ).not.toBeInTheDocument();
+        expect(requests[2].url.searchParams.has("snapshot")).toBe(false);
+        expect(requests[2].url.searchParams.get("mode")).toBe("relative");
+        expect(requests[2].url.searchParams.has("refresh")).toBe(false);
+        await respond(2, groups("s2"));
+        expect(requests[3].url.searchParams.get("snapshot")).toBe("s2");
+        await respond(3, { ...page(0, 20), snapshot: "s2" });
+        expect(
+            screen.getByRole("button", { name: /Visible label/ }),
+        ).toHaveAttribute("aria-expanded", "true");
+        expect(screen.getByText("example.com/history/0")).toBeInTheDocument();
+    });
+
+    it("bounds repeated snapshot expiry without clearing selection", async () => {
+        const input = props();
+        input.timeRange.grouping = "host";
+        input.selected = summary(0);
+        render(<PureHistoryTable {...input} />);
+        await act(async () =>
+            requests[0].resolve({ ok: false, status: 409 } as Response),
+        );
+        await act(async () =>
+            requests[1].resolve({ ok: false, status: 409 } as Response),
+        );
+        settle(5000);
+        expect(requests).toHaveLength(2);
+        expect(
+            screen.getByText(/History snapshot expired/),
+        ).toBeInTheDocument();
+        expect(input.onClear).not.toHaveBeenCalled();
+    });
+
+    it("starts grouped history at the bottom and keeps keyboard scrolling focused", async () => {
+        const input = props();
+        input.timeRange.grouping = "host";
+        render(<PureHistoryTable {...input} />);
+        await respond(0, {
+            instance_id: "instance-a",
+            count: 40,
+            group_count: 40,
+            offset: 0,
+            groups: Array.from({ length: 40 }, (_, ordinal) => ({
+                key: `g${String(ordinal).padStart(2, "0")}`,
+                count: 1,
+                ordinal,
+                members_before: ordinal,
+            })),
+        });
+        const viewport = screen.getByLabelText("History scroll area");
+        expect(viewport.scrollTop).toBe(960);
+        const button = screen.getByRole("button", { name: /g30/ });
+        button.focus();
+        fireEvent.keyDown(button, { key: "ArrowUp" });
+        expect(viewport.scrollTop).toBe(928);
+        expect(viewport).toHaveFocus();
+        button.focus();
+        fireEvent.keyDown(button, { key: "Home" });
+        expect(viewport.scrollTop).toBe(0);
+        expect(viewport).toHaveFocus();
+        fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
+        expect(viewport.scrollTop).toBe(32);
+    });
+
+    it.each([
+        ...[true, false].map((survives) => ({
+            grouping: "host" as const,
+            oldKey: "old.example",
+            newKey: "\u00c4new.example",
+            before: { host: "old.example" },
+            after: { host: "\u00c4NEW.EXAMPLE" },
+            survives,
+        })),
+        {
+            grouping: "status" as const,
+            oldKey: 200,
+            newKey: 404,
+            before: { status_code: 200 },
+            after: { status_code: 404 },
+            survives: true,
+        },
+        {
+            grouping: "method" as const,
+            oldKey: "GET",
+            newKey: "post",
+            before: { method: "GET" },
+            after: { method: "post" },
+            survives: true,
+        },
+        {
+            grouping: "type" as const,
+            oldKey: "http",
+            newKey: "tcp",
+            before: { type: "http" },
+            after: { type: "tcp" },
+            survives: true,
+        },
+        {
+            grouping: "host" as const,
+            oldKey: "old.example",
+            newKey: null,
+            before: { host: "old.example" },
+            after: { host: null },
+            survives: true,
+        },
+    ])(
+        "follows an anchored flow to $grouping key $newKey (old group survives=$survives)",
+        async ({ grouping, oldKey, newKey, before, after, survives }) => {
+            const input = props();
+            input.timeRange.grouping = grouping;
+            let moved = false;
+            const anchored = { ...summary(4, true), ...before };
+            const calls: URLSearchParams[] = [];
+            fetchMock.mockResponse(async (request) => {
+                const query = new URL(request.url, "http://localhost")
+                    .searchParams;
+                calls.push(query);
+                const oldRows = Array.from({ length: 20 }, (_, i) => ({
+                    ...summary(i, true),
+                    ...before,
+                })).filter(
+                    (row) => !moved || (survives && row.id !== anchored.id),
+                );
+                const newRows = [
+                    ...(moved ? [{ ...anchored, ...after }] : []),
+                    ...Array.from({ length: 20 }, (_, i) => ({
+                        ...summary(20 + i, true),
+                        ...after,
+                    })),
+                ];
+                const groups = [
+                    ...(oldRows.length
+                        ? [{ key: "g1:old", rows: oldRows }]
+                        : []),
+                    { key: "g1:new", rows: newRows },
+                ];
+                const descriptors = groups.map((group, ordinal) => ({
+                    key: group.key,
+                    label: String(ordinal ? newKey : oldKey),
+                    ordinal,
+                    count: group.rows.length,
+                    members_before: ordinal ? oldRows.length : 0,
+                }));
+                if (query.has("lookup_flow")) {
+                    const ordinal = groups.findIndex((group) =>
+                        group.rows.some(
+                            (row) => row.id === query.get("lookup_flow"),
+                        ),
+                    );
+                    return JSON.stringify({
+                        instance_id: "instance-a",
+                        snapshot: moved ? "s2" : "s1",
+                        group: descriptors[ordinal] ?? null,
+                        member_ordinal:
+                            ordinal < 0
+                                ? null
+                                : groups[ordinal].rows.findIndex(
+                                      (row) =>
+                                          row.id === query.get("lookup_flow"),
+                                  ),
+                    });
+                }
+                const all = [...oldRows, ...newRows].sort(
+                    (a, b) => a.timestamp_created - b.timestamp_created,
+                );
+                if (query.has("group_by") && !query.has("group_key")) {
+                    let before = 0;
+                    return JSON.stringify({
+                        instance_id: "instance-a",
+                        snapshot: moved ? "s2" : "s1",
+                        count: all.length,
+                        group_count: groups.length,
+                        offset: 0,
+                        groups: groups.map((group, ordinal) => {
+                            const result = {
+                                key: group.key,
+                                label: String(
+                                    group.key === "g1:old" ? oldKey : newKey,
+                                ),
+                                ordinal,
+                                count: group.rows.length,
+                                members_before: before,
+                            };
+                            before += group.rows.length;
+                            return result;
+                        }),
+                    });
+                }
+                const rows = query.has("group_key")
+                    ? (groups.find(
+                          (group) => group.key === query.get("group_key"),
+                      )?.rows ?? [])
+                    : all;
+                const offset = Number(
+                    query.get("offset") ??
+                        Math.max(0, rows.length - Number(query.get("limit"))),
+                );
+                const position = rows.findIndex(
+                    (row) => row.id === query.get("anchor"),
+                );
+                return JSON.stringify({
+                    ...page(0, rows.length),
+                    snapshot: moved ? "s2" : "s1",
+                    offset,
+                    rows: rows.slice(
+                        offset,
+                        offset + Number(query.get("limit")),
+                    ),
+                    anchor_position: position < 0 ? null : position,
+                });
+            });
+            const view = render(<PureHistoryTable {...input} />);
+            await act(async () => {});
+            fireEvent.click(
+                screen.getByRole("button", { name: "Expand all groups" }),
+            );
+            await act(async () => {});
+            scroll(167);
+            settle();
+            await act(async () => {});
+            moved = true;
+            view.rerender(
+                <PureHistoryTable
+                    {...input}
+                    timeRange={{ ...input.timeRange, historyRevision: 1 }}
+                />,
+            );
+            settle(1000);
+            await act(async () => {});
+            expect(screen.getByLabelText("History scroll area").scrollTop).toBe(
+                survives ? 679 : 39,
+            );
+            fireEvent.click(
+                screen.getByText(
+                    `${("host" in after ? after.host : anchored.host) ?? ""}/history/4`,
+                ),
+            );
+            expect(input.onSelect).toHaveBeenCalledWith({
+                ...anchored,
+                ...after,
+            });
+            expect(
+                calls.some(
+                    (query) =>
+                        query.get("lookup_flow") === anchored.id &&
+                        query.get("snapshot") === "s2",
+                ),
+            ).toBe(true);
+        },
+    );
+
+    it.each([true, false])(
+        "validates selected live flows independently of their old group key (eligible=%s)",
+        async (eligible) => {
+            const input = props();
+            input.timeRange.grouping = "host";
+            input.selected = summary(0, true);
+            render(<PureHistoryTable {...input} />);
+            await respond(0, {
+                instance_id: "instance-a",
+                count: 1,
+                group_count: 1,
+                offset: 0,
+                groups: [
+                    {
+                        key: "changed.example",
+                        count: 1,
+                        ordinal: 0,
+                        members_before: 0,
+                    },
+                ],
+            });
+            expect(input.onClear).not.toHaveBeenCalled();
+            expect(requests[1].url.searchParams.get("lookup_flow")).toBe(
+                input.selected.id,
+            );
+            expect(requests[1].url.searchParams.get("snapshot")).toBe("s1");
+            await respond(1, {
+                instance_id: "instance-a",
+                group: eligible
+                    ? {
+                          key: "changed.example",
+                          label: "changed.example",
+                          count: 1,
+                          ordinal: 0,
+                          members_before: 0,
+                      }
+                    : null,
+                member_ordinal: eligible ? 0 : null,
+            });
+            expect(input.onClear).toHaveBeenCalledTimes(eligible ? 0 : 1);
+            expect(
+                screen.getByRole("button", { name: /changed.example/ }),
+            ).toBeInTheDocument();
+        },
+    );
+
+    it("preserves expansion when scrolling during a grouped refresh", async () => {
+        const input = props();
+        input.timeRange.grouping = "host";
+        const view = render(<PureHistoryTable {...input} />);
+        const groups = {
+            instance_id: "instance-a",
+            count: 200,
+            group_count: 20,
+            offset: 0,
+            groups: Array.from({ length: 20 }, (_, ordinal) => ({
+                key: `g${String(ordinal).padStart(2, "0")}`,
+                count: 10,
+                ordinal,
+                members_before: ordinal * 10,
+            })),
+        };
+        await respond(0, groups);
+        fireEvent.click(screen.getByRole("button", { name: /g10/ }));
+        await act(async () => {});
+        await respond(1, page(0, 10));
+        scroll(160);
+        settle();
+        await act(async () => {});
+        view.rerender(
+            <PureHistoryTable
+                {...input}
+                timeRange={{ ...input.timeRange, historyRevision: 1 }}
+            />,
+        );
+        settle(1000);
+        scroll(192);
+        settle();
+        await act(async () => {});
+        expect(requests[2].signal?.aborted).toBe(false);
+        view.rerender(
+            <PureHistoryTable
+                {...input}
+                timeRange={{ ...input.timeRange, historyRevision: 2 }}
+            />,
+        );
+        await respond(2, { ...groups, snapshot: "s2" });
+        expect(requests[3].url.searchParams.get("group_key")).toBe("g10");
+        await respond(3, { ...page(0, 10), snapshot: "s2" });
+        expect(screen.getByRole("button", { name: /g10/ })).toHaveAttribute(
+            "aria-expanded",
+            "true",
+        );
+        expect(screen.getByRole("table")).toHaveAttribute(
+            "aria-rowcount",
+            "31",
+        );
+        settle(1000);
+        expect(requests[4].url.searchParams.get("refresh")).toBe("s2");
+    });
+
+    it("anchors a successor to the latest scroll position instead of the old bottom", async () => {
+        const input = props();
+        input.timeRange.grouping = "host";
+        const view = render(<PureHistoryTable {...input} />);
+        const groups = (insert: boolean, snapshot: string) => {
+            const keys = Array.from({ length: 40 }, (_, i) => `g${i}`);
+            if (insert) keys.unshift("new");
+            return {
+                instance_id: "instance-a",
+                snapshot,
+                lower: 100,
+                upper: 200,
+                count: keys.length,
+                group_count: keys.length,
+                offset: 0,
+                groups: keys.map((key, ordinal) => ({
+                    key,
+                    ordinal,
+                    count: 1,
+                    members_before: ordinal,
+                })),
+            };
+        };
+        await respond(0, groups(false, "s1"));
+        view.rerender(
+            <PureHistoryTable
+                {...input}
+                timeRange={{ ...input.timeRange, historyRevision: 1 }}
+            />,
+        );
+        settle(1000);
+        scroll(160);
+        settle();
+        await act(async () => {});
+        expect(requests[1].signal?.aborted).toBe(false);
+        expect(screen.getByRole("button", { name: /g5 / })).toBeInTheDocument();
+        await respond(1, groups(true, "s2"));
+        expect(screen.getByLabelText("History scroll area").scrollTop).toBe(
+            192,
+        );
+        expect(screen.getByRole("button", { name: /g5 / })).toBeInTheDocument();
+    });
+
+    it("starts a scheduled grouped refresh while scrolling continues", async () => {
+        const input = props();
+        input.timeRange.grouping = "host";
+        const view = render(<PureHistoryTable {...input} />);
+        await respond(0, {
+            instance_id: "instance-a",
+            snapshot: "s1",
+            count: 40,
+            group_count: 40,
+            offset: 0,
+            groups: Array.from({ length: 40 }, (_, ordinal) => ({
+                key: `g${ordinal}`,
+                count: 1,
+                ordinal,
+                members_before: ordinal,
+            })),
+        });
+        view.rerender(
+            <PureHistoryTable
+                {...input}
+                timeRange={{ ...input.timeRange, historyRevision: 1 }}
+            />,
+        );
+        for (let i = 0; i < 5; i++) {
+            scroll(32 * i);
+            settle(200);
+        }
+        expect(requests[1].url.searchParams.get("refresh")).toBe("s1");
+        expect(requests[1].signal?.aborted).toBe(false);
+    });
+
+    it("loads old snapshot members during successor preparation without mixing versions", async () => {
+        const input = props();
+        input.timeRange.grouping = "host";
+        const view = render(<PureHistoryTable {...input} />);
+        const group = {
+            key: "g1:host",
+            label: "host",
+            count: 1000,
+            ordinal: 0,
+            members_before: 0,
+        };
+        const groupPage = (snapshot: string) => ({
+            instance_id: "instance-a",
+            snapshot,
+            lower: 100,
+            upper: 200,
+            count: 1000,
+            group_count: 1,
+            offset: 0,
+            groups: [group],
+        });
+        await respond(0, groupPage("s1"));
+        fireEvent.click(screen.getByRole("button", { name: /host \(/ }));
+        await act(async () => {});
+        await respond(1, { ...page(0, 1000), snapshot: "s1" });
+        view.rerender(
+            <PureHistoryTable
+                {...input}
+                timeRange={{ ...input.timeRange, historyRevision: 1 }}
+            />,
+        );
+        settle(1000);
+        scroll(16032);
+        settle();
+        await act(async () => {});
+        expect(requests[2].signal?.aborted).toBe(false);
+        expect(requests[3].url.searchParams.get("snapshot")).toBe("s1");
+        expect(requests[3].url.searchParams.get("offset")).toBe("500");
+        await respond(3, { ...page(500, 1000), snapshot: "s1" });
+        expect(screen.getByText("example.com/history/500")).toBeInTheDocument();
+        await respond(2, groupPage("s2"));
+        expect(requests[4].url.searchParams.get("lookup_flow")).toBe(
+            summary(500).id,
+        );
+        scroll(0);
+        settle();
+        await act(async () => {});
+        await respond(4, {
+            instance_id: "instance-a",
+            snapshot: "s2",
+            group,
+            member_ordinal: 500,
+        });
+        expect(requests[5].url.searchParams.get("snapshot")).toBe("s2");
+        expect(requests[5].url.searchParams.get("offset")).toBe("0");
+        await respond(5, {
+            ...page(0, 1000),
+            snapshot: "s2",
+            rows: page(0, 1000).rows.map((row) => ({
+                ...row,
+                host: "successor",
+            })),
+        });
+        expect(requests[6].url.searchParams.get("snapshot")).toBe("s2");
+        expect(requests[6].url.searchParams.get("offset")).toBe("500");
+        await respond(6, {
+            ...page(500, 1000),
+            snapshot: "s2",
+            rows: page(500, 1000).rows.map((row) => ({
+                ...row,
+                host: "successor",
+            })),
+        });
+        expect(screen.getByLabelText("History scroll area").scrollTop).toBe(0);
+        expect(screen.getByText("successor/history/0")).toBeInTheDocument();
+        expect(
+            screen.queryByText("example.com/history/500"),
+        ).not.toBeInTheDocument();
+    });
+
+    it.each(["query", "unmount"])(
+        "cancels both grouped request lanes on %s",
+        async (reason) => {
+            const input = props();
+            input.timeRange.grouping = "host";
+            const view = render(<PureHistoryTable {...input} />);
+            await respond(0, {
+                instance_id: "instance-a",
+                snapshot: "s1",
+                count: 1000,
+                group_count: 1,
+                offset: 0,
+                groups: [
+                    { key: "host", count: 1000, ordinal: 0, members_before: 0 },
+                ],
+            });
+            fireEvent.click(screen.getByRole("button", { name: /host \(/ }));
+            await act(async () => {});
+            await respond(1, { ...page(0, 1000), snapshot: "s1" });
+            view.rerender(
+                <PureHistoryTable
+                    {...input}
+                    timeRange={{ ...input.timeRange, historyRevision: 1 }}
+                />,
+            );
+            settle(1000);
+            scroll(16032);
+            settle();
+            await act(async () => {});
+            expect(requests[3].url.searchParams.get("snapshot")).toBe("s1");
+            if (reason === "query")
+                view.rerender(<PureHistoryTable {...input} search="changed" />);
+            else view.unmount();
+            expect(requests[2].signal?.aborted).toBe(true);
+            expect(requests[3].signal?.aborted).toBe(true);
+            await respond(2, {
+                instance_id: "instance-a",
+                snapshot: "s2",
+                count: 0,
+                group_count: 0,
+                offset: 0,
+                groups: [],
+            });
+            await respond(3, { ...page(500, 1000), snapshot: "s1" });
+            expect(
+                screen.queryByText("example.com/history/500"),
+            ).not.toBeInTheDocument();
+        },
+    );
+
+    it("anchors grouped refreshes by key and coalesces live revisions", async () => {
+        const input = props();
+        input.timeRange.grouping = "host";
+        const view = render(<PureHistoryTable {...input} />);
+        const groups = (insert: boolean) => {
+            const keys = Array.from(
+                { length: 20 },
+                (_, i) => `g${String(i).padStart(2, "0")}`,
+            );
+            if (insert) keys.unshift("a");
+            return {
+                instance_id: "instance-a",
+                count: keys.length * 10,
+                group_count: keys.length,
+                offset: 0,
+                lower: 100,
+                upper: 200,
+                groups: keys.map((key, ordinal) => ({
+                    key,
+                    ordinal,
+                    count: 10,
+                    members_before: ordinal * 10,
+                })),
+            };
+        };
+        await respond(0, groups(false));
+        scroll(160);
+        settle();
+        await act(async () => {});
+        fireEvent.click(screen.getByRole("button", { name: /g05/ }));
+        await act(async () => {});
+        expect(requests[1].url.searchParams.get("mode")).toBe("absolute");
+        expect(requests[1].url.searchParams.get("from")).toBe("100");
+        await respond(1, page(0, 10));
+        for (let revision = 1; revision <= 5; revision++) {
+            view.rerender(
+                <PureHistoryTable
+                    {...input}
+                    timeRange={{
+                        ...input.timeRange,
+                        historyRevision: revision,
+                    }}
+                />,
+            );
+        }
+        expect(requests).toHaveLength(2);
+        settle(1000);
+        expect(requests).toHaveLength(3);
+        await respond(2, groups(true));
+        expect(requests[3].url.searchParams.get("group_key")).toBe("g05");
+        await respond(3, page(0, 10));
+        expect(screen.getByLabelText("History scroll area").scrollTop).toBe(
+            192,
+        );
+        expect(screen.getByRole("button", { name: /g05/ })).toHaveAttribute(
+            "aria-expanded",
+            "true",
+        );
+        expect(requests).toHaveLength(4);
+    });
+
+    it("rejects stale group responses after grouping changes", async () => {
+        const input = props();
+        input.timeRange.grouping = "host";
+        const view = render(<PureHistoryTable {...input} />);
+        view.rerender(
+            <PureHistoryTable
+                {...input}
+                timeRange={{ ...input.timeRange, grouping: "method" }}
+            />,
+        );
+        expect(requests[0].signal?.aborted).toBe(true);
+        await respond(0, {
+            instance_id: "instance-a",
+            count: 1,
+            group_count: 1,
+            offset: 0,
+            groups: [{ key: "stale", count: 1, ordinal: 0, members_before: 0 }],
+        });
+        expect(
+            screen.queryByRole("button", { name: /stale/ }),
+        ).not.toBeInTheDocument();
+        await respond(1, {
+            instance_id: "instance-a",
+            count: 1,
+            group_count: 1,
+            offset: 0,
+            groups: [{ key: "GET", count: 1, ordinal: 0, members_before: 0 }],
+        });
+        expect(screen.getByRole("button", { name: /GET/ })).toBeInTheDocument();
+    });
+
+    it("renders virtual group headers and expands only visible members", async () => {
+        const input = props();
+        input.timeRange.grouping = "host";
+        render(<PureHistoryTable {...input} />);
+        expect(requests[0].url.searchParams.get("group_by")).toBe("host");
+        await respond(0, {
+            instance_id: "instance-a",
+            count: 1000000,
+            group_count: 1,
+            offset: 0,
+            groups: [
+                {
+                    key: "example.com",
+                    count: 1000000,
+                    ordinal: 0,
+                    members_before: 0,
+                },
+            ],
+        });
+        expect(
+            screen.getByRole("button", { name: /example.com/ }),
+        ).toHaveAttribute("aria-expanded", "false");
+        expect(
+            screen.getByText("1,000,000 flows in 1 group"),
+        ).toBeInTheDocument();
+        expect(requests).toHaveLength(1);
+        fireEvent.click(
+            screen.getByRole("button", { name: "Expand all groups" }),
+        );
+        await act(async () => {});
+        expect(requests).toHaveLength(2);
+        expect(requests[1].url.searchParams.get("group_key")).toBe(
+            "example.com",
+        );
+        await respond(1, page(0));
+        expect(screen.getByRole("table")).toHaveAttribute(
+            "aria-rowcount",
+            "1000002",
+        );
+        expect(screen.getByText("example.com/history/0")).toBeInTheDocument();
+        fireEvent.click(screen.getByText("example.com/history/0"));
+        expect(input.onSelect).toHaveBeenCalledWith(summary(0));
+        fireEvent.click(
+            screen.getByRole("button", { name: "Collapse all groups" }),
+        );
+        await act(async () => {});
+        expect(screen.getByRole("table")).toHaveAttribute("aria-rowcount", "2");
+        expect(input.onClear).not.toHaveBeenCalled();
+    });
+
+    it("keeps selection when switching grouping, without sending selected to group pages", async () => {
+        const input = props();
+        input.selected = summary(0);
+        const view = render(<PureHistoryTable {...input} />);
+        await respond(0, page(0));
+        view.rerender(
+            <PureHistoryTable
+                {...input}
+                timeRange={{ ...input.timeRange, grouping: "host" }}
+            />,
+        );
+        expect(input.onClear).not.toHaveBeenCalled();
+        expect(
+            requests[requests.length - 1].url.searchParams.has("selected"),
+        ).toBe(false);
+    });
+
     it("waits for trusted backend state before requesting metadata", () => {
         const input = props();
         render(

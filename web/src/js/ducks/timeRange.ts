@@ -4,6 +4,14 @@ import type { AppThunk, RootState } from "./store";
 import { select } from "./flows";
 
 export type TimeRangeMode = "relative" | "explicit";
+export type Grouping = "none" | "host" | "method" | "status" | "type";
+export const groupingModes: Grouping[] = [
+    "none",
+    "host",
+    "method",
+    "status",
+    "type",
+];
 
 export interface TimeRangePreference {
     mode: TimeRangeMode;
@@ -20,6 +28,7 @@ export interface TimeRangeState {
     preference: TimeRangePreference;
     draft: TimeRangePreference;
     error: string | null;
+    grouping: Grouping;
 }
 
 export const relativePresets = [
@@ -47,6 +56,7 @@ export const defaultState: TimeRangeState = {
     preference,
     draft: preference,
     error: null,
+    grouping: "none",
 };
 
 const storageKey = "mitmweb.timeRange.v1";
@@ -117,6 +127,7 @@ const slice = createSlice({
                 instanceId: string;
                 preference: TimeRangePreference;
                 draft: TimeRangePreference;
+                grouping: Grouping;
             }>,
         ) {
             Object.assign(state, action.payload, { ready: true, error: null });
@@ -141,6 +152,9 @@ const slice = createSlice({
         invalidateHistory(state) {
             state.historyRevision++;
         },
+        groupingChanged(state, action: PayloadAction<Grouping>) {
+            state.grouping = action.payload;
+        },
         refreshed(state) {
             state.revision++;
             state.historyRevision++;
@@ -160,6 +174,7 @@ function persist(state: TimeRangeState) {
                 instanceId: state.instanceId,
                 preference: state.preference,
                 draft: state.draft,
+                grouping: state.grouping,
             }),
         );
     } catch {
@@ -173,10 +188,12 @@ export const establishBackend =
         if (typeof instanceId !== "string" || !instanceId.trim()) return;
         const current = getState().timeRange;
         let preference = defaultState.preference,
-            draft = defaultState.draft;
+            draft = defaultState.draft,
+            grouping = defaultState.grouping;
         if (current.instanceId === instanceId) {
             preference = current.preference;
             draft = current.draft;
+            grouping = current.grouping;
         } else {
             try {
                 const stored = JSON.parse(
@@ -191,12 +208,30 @@ export const establishBackend =
                     draft = isPreference(stored.draft)
                         ? stored.draft
                         : preference;
+                    if (groupingModes.includes(stored.grouping))
+                        grouping = stored.grouping;
                 }
             } catch {
                 // Malformed or unavailable storage falls back only after a real ID.
             }
         }
-        dispatch(slice.actions.established({ instanceId, preference, draft }));
+        dispatch(
+            slice.actions.established({
+                instanceId,
+                preference,
+                draft,
+                grouping,
+            }),
+        );
+        persist(getState().timeRange);
+    };
+
+export const setGrouping =
+    (grouping: Grouping): AppThunk =>
+    (dispatch, getState) => {
+        if (!getState().timeRange.ready || !groupingModes.includes(grouping))
+            return;
+        dispatch(slice.actions.groupingChanged(grouping));
         persist(getState().timeRange);
     };
 

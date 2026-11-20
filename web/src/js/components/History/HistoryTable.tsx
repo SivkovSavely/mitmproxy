@@ -16,6 +16,8 @@ import { fetchApi, formatSize, formatTimeStamp } from "../../utils";
 import type { RootState } from "../../ducks";
 import { clearSelectedSummary, selectSummary } from "../../ducks/history";
 import Icon from "../common/Icon";
+import { GroupedHistory, StaleSnapshot } from "../../groupedHistory";
+import type { Group, GroupRow } from "../../groupedHistory";
 
 type HistoryTableProps = {
     timeRange: TimeRangeState;
@@ -125,11 +127,16 @@ export class PureHistoryTable extends React.Component<
     private cache = new HistoryCache();
     private epoch = 0;
     private controller?: AbortController;
+    private groupRefresh?: AbortController;
+    private viewportVersion = 0;
     private debounce?: ReturnType<typeof setTimeout>;
     private prefetch?: ReturnType<typeof setTimeout>;
     private refreshTimer?: ReturnType<typeof setTimeout>;
     private scrolling = false;
     private refreshPending = false;
+    private grouped?: GroupedHistory;
+    private groupBounds?: { lower: number | null; upper: number | null };
+    private groupRows = new Map<number, GroupRow>();
 
     componentDidMount() {
         window.addEventListener("resize", this.onResize);
@@ -146,12 +153,20 @@ export class PureHistoryTable extends React.Component<
     }
 
     componentDidUpdate(previous: HistoryTableProps) {
-        if (queryKey(previous) !== queryKey(this.props)) {
+        const queryChanged = queryKey(previous) !== queryKey(this.props);
+        if (
+            queryChanged ||
+            previous.timeRange.grouping !== this.props.timeRange.grouping
+        ) {
             this.cancel();
+            this.cancelGroupRefresh();
             this.scrolling = false;
             this.refreshPending = false;
             this.cache.clear();
-            this.props.onClear();
+            this.grouped = undefined;
+            this.groupBounds = undefined;
+            this.groupRows.clear();
+            if (queryChanged) this.props.onClear();
             this.setState(
                 { count: null, top: 0, error: null, loading: false },
                 () => {
@@ -162,6 +177,7 @@ export class PureHistoryTable extends React.Component<
             );
         } else if (previous.timeRange.ready && !this.props.timeRange.ready) {
             this.cancel();
+            this.cancelGroupRefresh();
             this.scrolling = false;
             this.refreshPending = false;
             this.setState({ loading: false });
@@ -177,19 +193,27 @@ export class PureHistoryTable extends React.Component<
 
     componentWillUnmount() {
         this.cancel();
+        this.cancelGroupRefresh();
         window.removeEventListener("resize", this.onResize);
         this.viewport.current?.removeEventListener("wheel", this.onWheel);
         this.resizeObserver?.disconnect();
     }
 
-    private cancel() {
+    private cancel(preserveRefreshTimer = false) {
         this.epoch++;
         this.controller?.abort();
         this.controller = undefined;
         clearTimeout(this.debounce);
         clearTimeout(this.prefetch);
-        clearTimeout(this.refreshTimer);
-        this.refreshTimer = undefined;
+        if (!preserveRefreshTimer) {
+            clearTimeout(this.refreshTimer);
+            this.refreshTimer = undefined;
+        }
+    }
+
+    private cancelGroupRefresh() {
+        this.groupRefresh?.abort();
+        this.groupRefresh = undefined;
     }
 
     private atBottom() {
@@ -280,6 +304,7 @@ export class PureHistoryTable extends React.Component<
                 return;
         }
         event.preventDefault();
+        this.viewport.current?.focus({ preventScroll: true });
         this.moveTo(top);
     };
 
@@ -290,7 +315,8 @@ export class PureHistoryTable extends React.Component<
             (this.state.count ?? 0) * ROW_HEIGHT - this.state.height,
         );
         top = Math.max(0, Math.min(top, maximum));
-        this.cancel();
+        this.viewportVersion++;
+        this.cancel(!!this.grouped);
         this.scrolling = true;
         this.setState({ top, loading: false }, () => {
             this.syncPhysical();
@@ -308,6 +334,15 @@ export class PureHistoryTable extends React.Component<
             this.state.height,
             this.state.count ?? 0,
         );
+        if (this.grouped) {
+            for (let index = start; index < end; index++) {
+                if (!this.groupRows.has(index)) {
+                    void this.load({});
+                    break;
+                }
+            }
+            return;
+        }
         for (let index = start; index < end; index++) {
             if (!this.cache.rows.has(index)) {
                 void this.load({ offset: String(start) });
@@ -338,14 +373,20 @@ export class PureHistoryTable extends React.Component<
         if (!this.props.timeRange.ready) return;
         this.refreshPending = true;
         clearTimeout(this.prefetch);
-        if (this.scrolling || this.controller || this.refreshTimer) return;
+        const grouped = !!this.grouped;
+        if (
+            this.refreshTimer ||
+            this.groupRefresh ||
+            (!grouped && (this.scrolling || this.controller))
+        )
+            return;
         // Do not postpone this fixed window when more live updates arrive.
         this.refreshTimer = setTimeout(() => {
             this.refreshTimer = undefined;
             if (
                 !this.props.timeRange.ready ||
-                this.scrolling ||
-                this.controller
+                this.groupRefresh ||
+                (!this.grouped && (this.scrolling || this.controller))
             )
                 return;
             this.refreshPending = false;
@@ -358,6 +399,10 @@ export class PureHistoryTable extends React.Component<
         options: LoadOptions = {},
     ) {
         if (!this.props.timeRange.ready) return;
+        if (this.props.timeRange.grouping !== "none") {
+            await this.loadGrouped(options);
+            return;
+        }
         this.cancel();
         const epoch = this.epoch;
         const instance = this.props.timeRange.instanceId;
@@ -453,6 +498,274 @@ export class PureHistoryTable extends React.Component<
         }
     }
 
+    private async loadGrouped(
+        options: LoadOptions,
+        retry = false,
+        savedAnchor?: GroupRow,
+    ) {
+        const refreshing = !!options.replace && !!this.grouped;
+        const index = Math.floor(this.state.top / ROW_HEIGHT);
+        const anchor = savedAnchor ?? this.groupRows.get(index);
+        if (refreshing) this.cancelGroupRefresh();
+        else this.cancel(!!this.grouped);
+        const epoch = this.epoch;
+        const controller = new AbortController();
+        if (refreshing) this.groupRefresh = controller;
+        else this.controller = controller;
+        const instance = this.props.timeRange.instanceId;
+        const base = historyQuery(this.props.timeRange);
+        let bounds = options.replace ? undefined : this.groupBounds;
+        const requestWithBounds = async (
+            extra: Record<string, string>,
+            frozen: { lower: number | null; upper: number | null } | undefined,
+        ) => {
+            if (!current()) throw new DOMException("Aborted", "AbortError");
+            const query = new URLSearchParams(base);
+            if (frozen) {
+                query.set("mode", "absolute");
+                query.delete("duration");
+                query.delete("from");
+                query.delete("until");
+                if (frozen.lower !== null)
+                    query.set("from", String(frozen.lower));
+                if (frozen.upper !== null)
+                    query.set("until", String(frozen.upper));
+            }
+            query.set("limit", String(PAGE_SIZE));
+            query.set("search", this.props.search);
+            query.set("highlight", this.props.highlight);
+            query.set("group_by", this.props.timeRange.grouping);
+            for (const [key, value] of Object.entries(extra))
+                query.set(key, value);
+            const response = await fetchApi(`/flow-history?${query}`, {
+                signal: controller.signal,
+            });
+            if (response.status === 409) throw new StaleSnapshot();
+            if (!response.ok) {
+                const message = await response.text();
+                throw new Error(message || `HTTP ${response.status}`);
+            }
+            const result = await response.json();
+            if (!current()) throw new DOMException("Aborted", "AbortError");
+            if (result.instance_id !== this.props.timeRange.instanceId)
+                throw new Error("Backend instance changed");
+            return result;
+        };
+        const request = async (extra: Record<string, string>) => {
+            const result = await requestWithBounds(extra, bounds);
+            if (!bounds && "lower" in result && "upper" in result)
+                bounds = { lower: result.lower, upper: result.upper };
+            return result;
+        };
+        const model = new GroupedHistory(request);
+        const current = () =>
+            (refreshing
+                ? this.groupRefresh === controller
+                : this.epoch === epoch) &&
+            !controller.signal.aborted &&
+            this.props.timeRange.ready &&
+            this.props.timeRange.instanceId === instance;
+        if (this.grouped) {
+            model.expanded = this.grouped.expanded;
+            model.exceptions = new Map(this.grouped.exceptions);
+            model.groupPages = new Map(this.grouped.groupPages);
+            model.memberPages = new Map(this.grouped.memberPages);
+            model.groups = this.grouped.groups;
+            model.flows = this.grouped.flows;
+            model.snapshot = this.grouped.snapshot;
+        }
+        if (!refreshing) this.setState({ loading: true, error: null });
+        else this.setState({ error: null });
+        try {
+            let clearSelection = false,
+                selectedId: string | undefined,
+                checkedSelection = false;
+            if (options.replace || !model.snapshot) {
+                await model.initialize(
+                    retry ? undefined : this.grouped?.snapshot,
+                );
+            }
+            let top: number, start: number, rows: GroupRow[];
+            for (;;) {
+                if (!current()) return;
+                const version = this.viewportVersion;
+                const currentIndex = Math.floor(this.state.top / ROW_HEIGHT);
+                const bottom = this.atBottom();
+                let currentAnchor = refreshing
+                    ? (this.groupRows.get(currentIndex) ?? savedAnchor)
+                    : anchor;
+                if (
+                    refreshing &&
+                    !bottom &&
+                    !currentAnchor &&
+                    this.grouped?.snapshot
+                ) {
+                    const old = this.grouped;
+                    const previous = new GroupedHistory((extra) =>
+                        requestWithBounds(extra, this.groupBounds),
+                    );
+                    Object.assign(previous, {
+                        expanded: old.expanded,
+                        exceptions: new Map(old.exceptions),
+                        groupPages: new Map(old.groupPages),
+                        memberPages: new Map(old.memberPages),
+                        groups: old.groups,
+                        flows: old.flows,
+                        snapshot: old.snapshot,
+                    });
+                    currentAnchor = (
+                        await previous.window(currentIndex, currentIndex + 1)
+                    )[0];
+                }
+                top = this.state.top;
+                if (
+                    (options.replace || !this.grouped) &&
+                    !bottom &&
+                    currentAnchor
+                ) {
+                    const location = currentAnchor.row
+                        ? await model.findFlow(currentAnchor.row.id)
+                        : undefined;
+                    const group =
+                        location?.group ??
+                        (await model.find(currentAnchor.group.key));
+                    const member = location?.member ?? null;
+                    if (group)
+                        top =
+                            (model.position(group) +
+                                (member !== null && model.isExpanded(group)
+                                    ? member + 1
+                                    : 0)) *
+                                ROW_HEIGHT +
+                            (this.state.top % ROW_HEIGHT);
+                }
+                if (bottom) top = Infinity;
+                top = Math.max(
+                    0,
+                    Math.min(
+                        top,
+                        Math.max(
+                            0,
+                            model.count * ROW_HEIGHT - this.state.height,
+                        ),
+                    ),
+                );
+                const window = historyWindow(
+                    top,
+                    this.state.height,
+                    model.count,
+                );
+                start = window.start;
+                rows = await model.window(start, window.end);
+                const selection = this.props.selected?.id;
+                if (
+                    (options.replace || !this.grouped) &&
+                    (!checkedSelection || selectedId !== selection)
+                ) {
+                    selectedId = selection;
+                    clearSelection =
+                        !!selectedId && !(await model.findFlow(selectedId));
+                    checkedSelection = true;
+                }
+                if (!current()) return;
+                if (
+                    (!refreshing || version === this.viewportVersion) &&
+                    (!(options.replace || !this.grouped) ||
+                        selectedId === this.props.selected?.id)
+                )
+                    break;
+            }
+            if (clearSelection && this.props.selected?.id === selectedId)
+                this.props.onClear();
+            this.grouped = model;
+            this.groupBounds = bounds;
+            this.groupRows.clear();
+            this.cache.clear();
+            rows.forEach((row, i) => {
+                this.groupRows.set(start + i, row);
+                if (row.row) this.cache.rows.set(start + i, row.row);
+            });
+            if (refreshing) {
+                this.cancel(true);
+                this.scrolling = false;
+                this.groupRefresh = undefined;
+            } else this.controller = undefined;
+            this.setState({ count: model.count, top, loading: false }, () => {
+                this.syncPhysical();
+                if (this.refreshPending) this.requestRefresh();
+            });
+        } catch (error) {
+            if (current()) {
+                if (error instanceof StaleSnapshot) {
+                    if (refreshing && !retry) {
+                        await this.loadGrouped(options, true);
+                        return;
+                    }
+                    // Keep only stable expansion keys and the visible anchor for reconciliation.
+                    if (!refreshing) {
+                        this.grouped?.groupPages.clear();
+                        this.grouped?.memberPages.clear();
+                        if (this.grouped) this.grouped.snapshot = undefined;
+                        this.cache.clear();
+                        this.groupRows.clear();
+                        this.groupBounds = bounds;
+                    }
+                    if (!retry) {
+                        await this.loadGrouped(
+                            { ...options, replace: true },
+                            true,
+                            anchor,
+                        );
+                        return;
+                    }
+                }
+                if (refreshing) this.groupRefresh = undefined;
+                else this.controller = undefined;
+                this.setState(
+                    {
+                        loading: false,
+                        error:
+                            error instanceof Error
+                                ? error.message
+                                : "Request failed",
+                    },
+                    () => {
+                        if (this.refreshPending) this.requestRefresh();
+                    },
+                );
+            }
+        }
+    }
+
+    private changeExpansion = (expanded: boolean | Group) => {
+        if (!this.grouped || !this.props.timeRange.ready) return;
+        const index = Math.floor(this.state.top / ROW_HEIGHT);
+        const anchor = this.groupRows.get(index);
+        this.viewportVersion++;
+        if (this.groupRefresh) {
+            this.cancelGroupRefresh();
+            this.refreshPending = true;
+        }
+        this.cancel(true);
+        if (typeof expanded === "boolean") this.grouped.expandAll(expanded);
+        else this.grouped.toggle(expanded);
+        const top = anchor
+            ? (this.grouped.position(anchor.group) +
+                  (anchor.member !== null &&
+                  this.grouped.isExpanded(anchor.group)
+                      ? anchor.member + 1
+                      : 0)) *
+                  ROW_HEIGHT +
+              (this.state.top % ROW_HEIGHT)
+            : this.state.top;
+        this.groupRows.clear();
+        this.cache.clear();
+        this.setState(
+            { count: this.grouped.count, top },
+            () => void this.load({}),
+        );
+    };
+
     private schedulePrefetch() {
         clearTimeout(this.prefetch);
         if (this.refreshPending) return;
@@ -514,6 +827,37 @@ export class PureHistoryTable extends React.Component<
         const rows: React.ReactNode[] = [];
         for (let index = start; index < end; index++) {
             const row = this.cache.rows.get(index);
+            const grouped = this.groupRows.get(index);
+            if (grouped?.member === null) {
+                rows.push(
+                    <div
+                        role="row"
+                        aria-rowindex={index + 2}
+                        key={index}
+                        className="history-group"
+                        style={{ height: ROW_HEIGHT }}
+                    >
+                        <div role="cell">
+                            <button
+                                aria-expanded={this.grouped!.isExpanded(
+                                    grouped.group,
+                                )}
+                                disabled={!timeRange.ready || loading}
+                                onClick={() =>
+                                    this.changeExpansion(grouped.group)
+                                }
+                            >
+                                {this.grouped!.isExpanded(grouped.group)
+                                    ? "-"
+                                    : "+"}{" "}
+                                {grouped.group.label} (
+                                {grouped.group.count.toLocaleString()} flows)
+                            </button>
+                        </div>
+                    </div>,
+                );
+                continue;
+            }
             rows.push(
                 <div
                     role="row"
@@ -574,11 +918,32 @@ export class PureHistoryTable extends React.Component<
                             ? "Waiting for backend..."
                             : count === null
                               ? "Loading history..."
-                              : `${count.toLocaleString()} flows`}
+                              : this.grouped
+                                ? `${this.grouped.flows.toLocaleString()} flows in ${this.grouped.groups.toLocaleString()} ${this.grouped.groups === 1 ? "group" : "groups"}`
+                                : `${count.toLocaleString()} flows`}
                     </span>
                     <span>
-                        Chronological order. Column sorting is unavailable.
+                        {timeRange.grouping === "none"
+                            ? "Chronological order."
+                            : `Grouped by ${timeRange.grouping}. Members are chronological.`}{" "}
+                        Column sorting is unavailable.
                     </span>
+                    {timeRange.grouping !== "none" && (
+                        <>
+                            <button
+                                disabled={!timeRange.ready || loading}
+                                onClick={() => this.changeExpansion(true)}
+                            >
+                                Expand all groups
+                            </button>
+                            <button
+                                disabled={!timeRange.ready || loading}
+                                onClick={() => this.changeExpansion(false)}
+                            >
+                                Collapse all groups
+                            </button>
+                        </>
+                    )}
                     {search && (
                         <span>
                             Search shows LIVE matching flows only. Historical

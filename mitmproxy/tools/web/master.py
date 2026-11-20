@@ -34,6 +34,7 @@ class WebMaster(master.Master):
         self.instance_id = secrets.token_hex(32)
         self.history = history.HistoryReader()
         self.view = view.View()
+        self.history.live_index = history.LiveHistoryIndex(self.view)
         self.view.sig_view_add.connect(self.history.sizes.changed)
         self.view.sig_view_update.connect(self.history.sizes.changed)
         self.view.sig_view_remove.connect(self.history.sizes.changed)

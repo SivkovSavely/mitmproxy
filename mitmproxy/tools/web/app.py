@@ -11,6 +11,7 @@ import os.path
 import re
 import secrets
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -580,15 +581,52 @@ class FlowHistory(RequestHandler):
             raise APIError(400, str(error)) from error
         self.set_header("Cache-Control", "no-store")
         generation = self.master.history.generation
-        live = self.view.resolve("@all")
         path = os.path.abspath(os.path.expanduser(configured_path))
+        grouped = "group_by" in query.page_options
+        if grouped and count is not None:
+            raise APIError(400, "Grouped snapshots do not support count-only requests.")
+        live = [] if grouped else self.view.resolve("@all")
         try:
-            page = await self.master.history.page(
-                path, query, live, self.cancel, count_only=count is not None
-            )
+            if grouped:
+                page = await self.master.history.grouped_page(
+                    path,
+                    query,
+                    live,
+                    self.cancel,
+                    instance_id=self.master.instance_id,
+                    live_generation=lambda: self.view.generation,
+                )
+            else:
+                page = await self.master.history.page(
+                    path, query, live, self.cancel, count_only=count is not None
+                )
+        except history.HistoryStale as error:
+            raise APIError(409, str(error)) from error
         except history.HistoryBusy:
             raise APIError(503, "Flow history is busy; retry later.") from None
-        except sqlite.StorageError as error:
+        except history.LiveIndexError as error:
+            if self.cancel.is_set():
+                return
+            if str(error).startswith("live filter input unavailable"):
+                reason = (
+                    "a required captured event-time value was evicted. "
+                    if "evicted" in str(error)
+                    else "a required input exceeds the 1048576-byte capture or "
+                    "decoding budget, or cannot be evaluated within that budget. "
+                )
+                raise APIError(
+                    503,
+                    "Live filter input unavailable: "
+                    + reason
+                    + "Clear the filter or use No grouping.",
+                ) from error
+            logger.warning("Cannot read live flow history: %s", error)
+            raise APIError(503, "Flow history is unavailable.") from error
+        except (
+            sqlite.StorageError,
+            history.SnapshotError,
+            sqlite3.Error,
+        ) as error:
             if self.cancel.is_set():
                 return
             logger.warning("Cannot read flow history: %s", error)
@@ -603,8 +641,8 @@ class FlowHistory(RequestHandler):
             page
             | {
                 "instance_id": self.master.instance_id,
-                "lower": query.lower,
-                "upper": query.upper,
+                "lower": page.get("lower", query.lower),
+                "upper": page.get("upper", query.upper),
                 "historical_search_unsupported": query.search is not None,
                 "historical_highlight_unsupported": query.highlight is not None,
             }

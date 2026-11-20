@@ -40,6 +40,388 @@ def history_live(flow_id, timestamp, *, matches=True, highlighted=False):
     }
 
 
+def test_revision_tracks_commits_across_connections(history_store):
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        identity, revision = reader.revision()
+        assert len(identity) == 32
+        assert revision == 5
+        with sqlite.SQLiteFlowStore(history_store.path) as other:
+            assert reader.revision() == (identity, 5)
+            other.db.execute("BEGIN IMMEDIATE")
+            other.db.execute("UPDATE flows SET host='changed' WHERE sequence=1")
+            assert reader.revision() == (identity, 5)
+            other.db.execute("ROLLBACK")
+            assert reader.revision() == (identity, 5)
+            other.db.execute("UPDATE flows SET host='changed' WHERE sequence=1")
+            assert reader.revision() == (identity, 6)
+            other.db.execute("DELETE FROM flows WHERE sequence=1")
+            assert reader.revision() == (identity, 7)
+        sqlite.ensure_history_index(history_store.path)
+        assert reader.revision() == (identity, 7)
+    with sqlite.SQLiteFlowReader(history_store.path) as reopened:
+        assert reopened.revision() == (identity, 7)
+
+
+def test_revision_uses_reader_snapshot(history_store):
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        reader.db.execute("BEGIN")
+        original = reader.revision()
+        history_store.db.execute("DELETE FROM flows")
+        assert reader.revision() == original
+        assert len(reader.newest(10)) == 5
+        reader.db.rollback()
+        assert reader.revision() == (original[0], original[1] + 5)
+        assert reader.newest(10) == []
+
+
+def test_changes_preserve_versions_and_rollback(history_store):
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        start = reader.revision()[1]
+        history_store.db.execute("BEGIN")
+        history_store.db.execute(
+            "UPDATE flows SET host='rolled back' WHERE flow_id='a'"
+        )
+        history_store.db.rollback()
+        history_store.db.execute(
+            "UPDATE flows SET flow_id='renamed',timestamp=2,method=x'ff',payload_version=2 WHERE flow_id='a'"
+        )
+        history_store.db.execute(
+            "UPDATE flows SET host='second' WHERE flow_id='renamed'"
+        )
+        history_store.db.execute("DELETE FROM flows WHERE flow_id='renamed'")
+        rows = reader.changes(start, start + 3, 10)
+        assert [r["revision"] for r in rows] == [start + 1, start + 2, start + 3]
+        assert (
+            rows[0]["old_flow_id"],
+            rows[0]["flow_id"],
+            rows[0]["timestamp"],
+            rows[0]["method"],
+            rows[0]["payload_version"],
+        ) == ("a", "renamed", 2, b"\xff", 2)
+        assert rows[0]["host"] == "example.com"
+        assert rows[1]["host"] == "second"
+        assert rows[2]["old_flow_id"] == "renamed"
+        assert rows[2]["flow_id"] is None
+        assert reader.changes(start, start + 3, 1) == rows[:1]
+
+
+def test_changes_replace_conflict_expires_cursor(history_store):
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        start = reader.revision()[1]
+        history_store.db.execute(
+            "UPDATE OR REPLACE flows SET flow_id='b' WHERE flow_id='a'"
+        )
+        with pytest.raises(sqlite.StorageError, match="journal.*expired"):
+            reader.changes(start, reader.revision()[1], 10)
+
+
+def test_changes_ignored_conflict_does_not_corrupt_revision(history_store):
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        start = reader.revision()[1]
+        history_store.db.execute(
+            "INSERT OR IGNORE INTO flows (flow_id,timestamp,flow_type,payload_version,codec,raw_length,payload) VALUES ('a',1,'http',1,'zstd',1,x'00')"
+        )
+        assert reader.revision()[1] == start
+        assert reader.changes(start, start, 1) == []
+        history_store.db.execute("UPDATE flows SET host='changed' WHERE flow_id='a'")
+        with pytest.raises(sqlite.StorageError, match="journal.*expired"):
+            reader.changes(start, start + 1, 1)
+
+
+def test_changes_bounds(history_store):
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        for args in [
+            (-1, 2, 1),
+            (2, 1, 1),
+            (0, 2**63, 1),
+            (0, 1, 0),
+            (0, 1, 8193),
+            (False, 1, 1),
+        ]:
+            with pytest.raises(ValueError):
+                reader.changes(*args)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "DELETE FROM flow_change_state",
+        "UPDATE flow_change_state SET floor=6",
+        "UPDATE flow_change_state SET watermark=-1",
+        "UPDATE flow_change_state SET pending_gap=2",
+    ],
+)
+def test_changes_reject_invalid_journal_state(history_store, statement):
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        history_store.db.execute(statement)
+        with pytest.raises(
+            sqlite.StorageError, match="Invalid flow revision journal state"
+        ):
+            reader.revision()
+        if statement.startswith("DELETE"):
+            with pytest.raises(
+                sqlite.StorageError, match="Invalid flow change journal state"
+            ):
+                reader.changes(0, 5, 1)
+
+
+def test_changes_wraps_sqlite_read_failure(history_store):
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+
+        def authorize(action, table, column, database, trigger):
+            if action == sqlite3.SQLITE_READ and table == "flow_changes":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        reader.db.set_authorizer(authorize)
+        with pytest.raises(
+            sqlite.StorageError, match="Cannot read flow change journal"
+        ) as exc:
+            reader.changes(0, 5, 1)
+        assert isinstance(exc.value.__cause__, sqlite3.DatabaseError)
+
+
+@pytest.mark.parametrize("initialize", ["writer", "history"])
+def test_changes_migrate_counter_only(tmp_path, initialize):
+    path = tmp_path / "legacy"
+    with sqlite.SQLiteFlowStore(path) as store:
+        db = store.db
+        for name in sqlite._JOURNAL_TRIGGERS:
+            db.execute(f"DROP TRIGGER {name}")
+        db.execute("DROP TABLE flow_changes")
+        db.execute("DROP TABLE flow_change_state")
+        for sql in sqlite._REVISION_TRIGGERS.values():
+            db.execute(sql)
+        db.execute("UPDATE flow_revision SET revision=7")
+        identity = db.execute("SELECT database_id FROM flow_revision").fetchone()[0]
+    if initialize == "writer":
+        with sqlite.SQLiteFlowStore(path):
+            pass
+    else:
+        sqlite.ensure_history_index(path)
+    sqlite.ensure_history_index(path)
+    with sqlite.SQLiteFlowReader(path) as reader:
+        assert reader.revision() == (identity, 7)
+        with pytest.raises(sqlite.StorageError, match="journal.*expired"):
+            reader.changes(6, 7, 1)
+        assert reader.changes(7, 7, 1) == []
+
+
+def test_changes_retention_and_oversized_metadata(history_store):
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        start = reader.revision()[1]
+        history_store.db.execute(
+            "UPDATE flows SET flow_type=?,method=?,host=?,path=? WHERE flow_id='a'",
+            ("t" * 1048577, b"m" * 1048577, "h" * 1048577, "p" * 5000),
+        )
+        change = reader.changes(start, start + 1, 1)[0]
+        assert change["oversized"] == 7
+        assert (change["flow_type"], change["method"], change["host"]) == (
+            None,
+            None,
+            None,
+        )
+        assert change["path"] == "p" * 4096
+        # Each retained record is just under 1 MiB, so this exceeds 64 MiB.
+        history_store.db.execute(
+            "UPDATE flows SET flow_type='http', method=?,host=NULL,path=NULL WHERE flow_id='a'",
+            (b"x" * 1048576,),
+        )
+        for _ in range(66):
+            history_store.db.execute(
+                "UPDATE flows SET timestamp=timestamp+1 WHERE flow_id='a'"
+            )
+        with pytest.raises(sqlite.StorageError, match="journal.*expired"):
+            reader.changes(start, reader.revision()[1], 8192)
+        floor, watermark = history_store.db.execute(
+            "SELECT floor,watermark FROM flow_change_state"
+        ).fetchone()
+        first = history_store.db.execute(
+            "SELECT min(watermark) FROM flow_changes"
+        ).fetchone()[0]
+        assert watermark - first <= 64 * 1024 * 1024
+        assert reader.changes(floor, reader.revision()[1], 8192)
+
+
+def test_changes_watermark_rollover_and_rollback(history_store):
+    db = history_store.db
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        identity, start = reader.revision()
+        before = reader.changes(0, start, 10)
+        db.execute("UPDATE flow_change_state SET watermark=?", (2**63 - 100,))
+        db.execute("BEGIN")
+        db.execute("UPDATE flows SET host='rolled back' WHERE flow_id='a'")
+        db.rollback()
+        assert reader.revision() == (identity, start)
+        assert reader.changes(0, start, 10) == before
+        assert db.execute(
+            "SELECT floor,watermark FROM flow_change_state"
+        ).fetchone() == (
+            0,
+            2**63 - 100,
+        )
+
+        db.execute("UPDATE flows SET host='rollover',method=x'ff' WHERE flow_id='a'")
+        assert reader.revision() == (identity, start + 1)
+        with pytest.raises(sqlite.StorageError, match="journal.*expired"):
+            reader.changes(start - 1, start + 1, 10)
+        rows = reader.changes(start, start + 1, 10)
+        assert len(rows) == 1
+        assert (
+            rows[0]["old_flow_id"],
+            rows[0]["flow_id"],
+            rows[0]["host"],
+            rows[0]["method"],
+        ) == ("a", "a", "rollover", b"\xff")
+        floor, watermark = db.execute(
+            "SELECT floor,watermark FROM flow_change_state"
+        ).fetchone()
+        assert floor == start
+        assert type(watermark) is int and 0 < watermark < 4096
+        assert db.execute("SELECT count(*) FROM flow_changes").fetchone()[0] == 1
+        db.execute("UPDATE flows SET host='continued' WHERE flow_id='a'")
+        assert [row["host"] for row in reader.changes(start, start + 2, 10)] == [
+            "rollover",
+            "continued",
+        ]
+
+
+def test_changes_snapshot_and_no_payload_reads(history_store):
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        reader.db.execute("BEGIN")
+        start = reader.revision()[1]
+        history_store.db.execute("UPDATE flows SET host='later' WHERE flow_id='a'")
+        assert reader.changes(start, start + 1, 10) == []
+        reader.db.rollback()
+
+        def authorize(action, table, column, database, trigger):
+            if action == sqlite3.SQLITE_READ and (
+                table == "flows" or column in ("payload", "codec", "raw_length")
+            ):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        reader.db.set_authorizer(authorize)
+        assert reader.changes(start, start + 1, 10)[0]["host"] == "later"
+
+
+@pytest.mark.parametrize("initialize", ["writer", "history"])
+def test_revision_initializes_legacy_database(tmp_path, initialize):
+    path = tmp_path / "legacy.db"
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute(sqlite._SCHEMA)
+        db.execute(f"PRAGMA application_id={sqlite._APP_ID}")
+        db.execute("PRAGMA user_version=1")
+        db.execute(
+            "INSERT INTO flows (flow_id,timestamp,flow_type,payload_version,codec,raw_length,payload) VALUES ('old',1,'http',1,'zstd',1,x'00')"
+        )
+    with sqlite.SQLiteFlowReader(path) as reader:
+        with pytest.raises(sqlite.StorageError, match="revision"):
+            reader.revision()
+    if initialize == "writer":
+        with sqlite.SQLiteFlowStore(path):
+            pass
+    else:
+        sqlite.ensure_history_index(path)
+    with sqlite.SQLiteFlowReader(path) as reader:
+        identity, revision = reader.revision()
+        assert revision == 0
+        assert reader.newest(1)[0].flow_id == "old"
+    sqlite.ensure_history_index(path)
+    with sqlite.SQLiteFlowReader(path) as reader:
+        assert reader.revision() == (identity, 0)
+
+
+def test_revision_idempotent_write_and_conflict(tmp_path):
+    path = tmp_path / "db"
+    state = tflow.tflow().get_state()
+    with sqlite.SQLiteFlowStore(path) as store, sqlite.SQLiteFlowReader(path) as reader:
+        store.write(state)
+        original = reader.revision()
+        store.write(state)
+        assert reader.revision() == original
+        state["comment"] = "different"
+        with pytest.raises(sqlite.StorageError, match="conflicting"):
+            store.write(state)
+        assert reader.revision() == original
+
+
+def test_revision_overflow_rolls_back_mutation(history_store):
+    history_store.db.execute("UPDATE flow_revision SET revision=9223372036854775807")
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        original = reader.revision()
+        with pytest.raises(sqlite3.IntegrityError, match="revision"):
+            history_store.db.execute("DELETE FROM flows")
+        assert reader.revision() == original
+        assert len(reader.newest(10)) == 5
+
+
+@pytest.mark.parametrize("damage", ["table", "trigger", "row"])
+def test_revision_rejects_invalid_state(history_store, damage):
+    if damage == "table":
+        history_store.db.execute("DROP TABLE flow_revision")
+        history_store.db.execute("CREATE TABLE flow_revision (wrong)")
+    elif damage == "trigger":
+        history_store.db.execute("DROP TRIGGER flows_revision_update")
+    else:
+        history_store.db.execute("DELETE FROM flow_revision")
+    with pytest.raises(sqlite.StorageError, match="revision"):
+        sqlite.ensure_history_index(history_store.path)
+    with pytest.raises(sqlite.StorageError, match="revision"):
+        sqlite.SQLiteFlowStore(history_store.path)
+    with pytest.raises(sqlite.StorageError, match="revision"):
+        sqlite.SQLiteFlowReader(history_store.path)
+
+
+def test_revision_distinguishes_replacement(tmp_path):
+    identities = []
+    for name in ("first", "replacement"):
+        with sqlite.SQLiteFlowStore(tmp_path / name):
+            pass
+        with sqlite.SQLiteFlowReader(tmp_path / name) as reader:
+            identities.append(reader.revision())
+    (tmp_path / "replacement").replace(tmp_path / "first")
+    with sqlite.SQLiteFlowReader(tmp_path / "first") as reader:
+        assert reader.revision() == identities[1]
+        assert reader.revision() != identities[0]
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    [
+        ("singleton", 2),
+        ("database_id", b"a" * 32),
+        ("database_id", "short"),
+        ("database_id", "z" * 32),
+        ("revision", 0.5),
+        ("revision", -1),
+    ],
+)
+def test_revision_revalidates_corrupt_values_after_open(history_store, column, value):
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        assert reader.revision()[1] == 5
+        history_store.db.execute("PRAGMA ignore_check_constraints=ON")
+        history_store.db.execute(f"UPDATE flow_revision SET {column}=?", (value,))
+        with pytest.raises(sqlite.StorageError, match="Invalid flow revision state"):
+            reader.revision()
+
+
+def test_revision_wraps_sqlite_read_failure(history_store):
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+
+        def authorize(action, table, column, database, trigger):
+            if action == sqlite3.SQLITE_READ and table == "flow_revision":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        reader.db.set_authorizer(authorize)
+        with pytest.raises(
+            sqlite.StorageError, match="Cannot read flow revision"
+        ) as exc:
+            reader.revision()
+        assert isinstance(exc.value.__cause__, sqlite3.DatabaseError)
+
+
 def test_history_index_created_by_writer(history_store):
     plan = history_store.db.execute(
         "EXPLAIN QUERY PLAN SELECT timestamp,sequence FROM flows WHERE timestamp>=? AND timestamp<=? ORDER BY timestamp,sequence LIMIT 2 OFFSET 1",
@@ -72,10 +454,7 @@ def test_ensure_history_index_only_changes_index(history_store, monkeypatch):
         "UPDATE flows SET payload_version=2,codec='zstd-chunks' WHERE sequence=1"
     )
     history_store.db.execute("INSERT INTO flow_payload_chunks VALUES (1,0,1,x'001122')")
-    for name, sql in history_store.db.execute(
-        "SELECT name,sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
-    ).fetchall():
-        history_store.db.execute(f'DROP INDEX "{name}"')
+    history_store.db.execute("DROP INDEX flows_chronological")
     before = history_store.db.execute("SELECT * FROM flows").fetchall()
     chunks = history_store.db.execute("SELECT * FROM flow_payload_chunks").fetchall()
     connect = sqlite3.connect
@@ -283,6 +662,18 @@ def test_history_absolute_and_newest(history_store):
         assert (beyond["offset"], beyond["rows"]) == (5, [])
         assert [row.flow_id for row in reader.newest(2)] == ["e", "d"]
         assert [row.flow_id for row in reader.older(4, 2)] == ["c", "b"]
+
+
+def test_history_surrogateescaped_methods(history_store):
+    first = history_live("first", 10) | {"method": "G\udcffT"}
+    second = history_live("second", 20) | {"method": "G\udcfeT"}
+    with sqlite.SQLiteFlowReader(history_store.path) as reader:
+        arguments = {"live": [first, second], "include_history": False}
+        rows = reader.history_page(**arguments)["rows"]
+        assert [(row["id"], row["method"]) for row in rows] == [
+            ("first", "G\ufffdT"),
+            ("second", "G\ufffdT"),
+        ]
 
 
 @pytest.mark.parametrize(

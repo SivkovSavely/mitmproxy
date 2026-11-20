@@ -6,6 +6,8 @@ import { update as updateOptions } from "../../ducks/options";
 import { useAppDispatch, useAppSelector } from "../../ducks";
 import { FilterName, setFilter, setHighlight } from "../../ducks/ui/filter";
 import TimeRangeSelector from "./TimeRangeSelector";
+import { setGrouping } from "../../ducks/timeRange";
+import type { Grouping } from "../../ducks/timeRange";
 
 FlowListMenu.title = "Flow List";
 
@@ -15,6 +17,7 @@ export default function FlowListMenu() {
             <div className="menu-group">
                 <div className="menu-content">
                     <TimeRangeSelector />
+                    <GroupingSelector />
                     <FlowFilterInput />
                     <HighlightInput />
                 </div>
@@ -29,6 +32,43 @@ export default function FlowListMenu() {
                 <div className="menu-legend">Intercept</div>
             </div>
         </div>
+    );
+}
+
+function GroupingSelector() {
+    const dispatch = useAppDispatch();
+    const { ready, grouping } = useAppSelector((state) => state.timeRange);
+    const enabled = useAppSelector(
+        (state) => state.backendState.sqlite_history,
+    );
+    if (!enabled) return null;
+
+    const options: [Grouping, string][] = [
+        ["none", "No grouping"],
+        ["host", "Request host"],
+        ["method", "Request method"],
+        ["status", "Response status"],
+        ["type", "Flow protocol/type"],
+    ];
+    return (
+        <label>
+            Group by
+            <select
+                className="input"
+                aria-label="Group flows by"
+                value={grouping}
+                disabled={!ready}
+                onChange={(event) =>
+                    dispatch(setGrouping(event.target.value as Grouping))
+                }
+            >
+                {options.map(([value, label]) => (
+                    <option key={value} value={value}>
+                        {label}
+                    </option>
+                ))}
+            </select>
+        </label>
     );
 }
 

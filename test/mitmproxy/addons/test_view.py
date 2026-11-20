@@ -2,8 +2,11 @@ import pytest
 
 from mitmproxy import exceptions
 from mitmproxy import flowfilter
+from mitmproxy import http
 from mitmproxy import io
 from mitmproxy.addons import view
+from mitmproxy.proxy.layers.http import HttpRequestHeadersHook
+from mitmproxy.proxy.layers.http import HttpResponseHeadersHook
 from mitmproxy.test import taddons
 from mitmproxy.test import tflow
 from mitmproxy.tools.console import consoleaddons
@@ -16,6 +19,128 @@ def tft(*, method="get", start=0):
     f.request.method = method
     f.timestamp_created = start
     return f
+
+
+def test_store_signals_cover_hidden_and_reset():
+    v = view.View()
+    v.set_filter_cmd("~m get")
+    hidden = tft(method="put")
+    events = []
+
+    def added(flow):
+        events.append(("add", flow.id, v.generation))
+
+    def updated(flow):
+        events.append(("update", flow.id, v.generation))
+
+    def removed(flow):
+        events.append(("remove", flow.id, v.generation))
+
+    def cleared():
+        events.append(("clear", v.generation))
+
+    v.sig_store_add.connect(added)
+    v.sig_store_update.connect(updated)
+    v.sig_store_remove.connect(removed)
+    v.sig_store_clear.connect(cleared)
+    v.add([hidden])
+    v.update([hidden])
+    v.clear_not_marked()
+    v.clear()
+    assert events == [
+        ("add", hidden.id, 1),
+        ("update", hidden.id, 2),
+        ("remove", hidden.id, 3),
+        ("clear", 3),
+    ]
+
+
+def test_generation_tracks_stored_flows_including_hidden():
+    v = view.View()
+    visible, hidden, unknown = tft(method="get"), tft(method="put"), tft()
+    v.set_filter_cmd("~m get")
+    assert v.generation == 0
+    v.add([visible, hidden, visible])
+    assert v.generation == 2
+    v.update([visible, hidden, unknown])
+    assert v.generation == 4
+    v.remove([hidden, unknown, hidden])
+    assert v.generation == 5
+    v.clear()
+    assert v.generation == 6
+    v.clear()
+    assert v.generation == 6
+
+
+def test_generation_clear_not_marked_and_notifications():
+    v = view.View()
+    visible, hidden = tft(method="get"), tft(method="put")
+    visible.marked = True
+    v.set_filter_cmd("~m get")
+    observed = []
+
+    def record(*args, **kwargs):
+        observed.append(v.generation)
+
+    v.sig_view_add.connect(record)
+    v.sig_view_update.connect(record)
+    v.sig_view_remove.connect(record)
+    v.sig_view_refresh.connect(record)
+    v.sig_store_remove.connect(record)
+    v.sig_store_refresh.connect(record)
+    v.add([visible, hidden])
+    v.update([visible])
+    v.clear_not_marked()
+    assert observed == [1, 3, 4, 4, 4]
+    v.clear_not_marked()
+    assert v.generation == 4
+    v.remove([visible])
+    assert observed[-2:] == [5, 5]
+
+
+def test_generation_requires_update_for_in_place_changes():
+    v = view.View()
+    f = tft()
+    v.add([f])
+    f.request.method = "POST"
+    assert v.generation == 1
+    v.update([f])
+    assert v.generation == 2
+    v.set_filter(None)
+    v.set_order("method")
+    v.set_reversed(True)
+    v.toggle_marked()
+    assert v.generation == 2
+
+
+@pytest.mark.parametrize("method,stream", [("get", False), ("put", True)])
+async def test_responseheaders_updates_view_during_addon_lifecycle(method, stream):
+    v = view.View()
+    f = tft(method=method)
+    updates = []
+    observed = []
+
+    def record(flow):
+        updates.append((flow, v.generation))
+
+    class Observer:
+        def responseheaders(self, flow):
+            observed.append((v.generation, list(updates), flow.response.status_code))
+
+    with taddons.context(v, Observer()) as tctx:
+        v.set_filter_cmd("~m get")
+        v.sig_view_update.connect(record)
+        await tctx.master.addons.handle_lifecycle(HttpRequestHeadersHook(f))
+        updates.clear()
+        before = v.generation
+        f.response = http.Response.make(201)
+        f.response.stream = stream
+        await tctx.master.addons.handle_lifecycle(HttpResponseHeadersHook(f))
+
+        expected_updates = [(f, before + 1)] if method == "get" else []
+        assert observed == [(before + 1, expected_updates, 201)]
+        assert v.get_by_id(f.id) is f
+        assert (f in v) == (method == "get")
 
 
 def test_order_refresh():
